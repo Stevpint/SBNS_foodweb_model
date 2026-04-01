@@ -9,7 +9,34 @@ library(lubridate)
 library(gridGraphics)
 library(ggplot2)
 library(MASS)
-
+## function RSI_graph adjusted
+RSI_graph_SP <- function (data, col, time, rsi, mean_lines = FALSE){
+  p1 <- ggplot(data) + geom_col(aes(x = .data[[time]], y = .data[[col]]))+
+      theme_bw()+
+      theme(
+        text = element_text(size = 10),
+        axis.text.x = element_text(angle = 90, hjust = 1, colour = "black", size = 14),
+        axis.text.y = element_text(colour = "black", size = 14),
+        axis.title.x = element_text(colour = "black", size = 16,),
+        axis.title.y = element_text(colour = "black", size = 16,),
+        strip.text = element_text(size = 12),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank()
+      )+
+    labs(x = 'Year', y = "Anomalies")
+  if (mean_lines) {
+    means <- rshift::regime_means(data, col, rsi)
+    p1 <- p1 + geom_line(aes(x = .data[[time]], y = means),
+                         color = "red")
+  }
+  p2 <- ggplot(data) + geom_col(aes(x = .data[[time]], y = .data[[rsi]]))
+  grid::pushViewport(grid::viewport(layout = grid::grid.layout(2,
+                                                               1)))
+  vplayout <- function(x, y) grid::viewport(layout.pos.row = x,
+                                            layout.pos.col = y)
+  print(p1, vp = vplayout(1, 1))
+  print(p2, vp = vplayout(2, 1))
+  return(p1)
+}
 ## function to get regime shifts using package 'rshift'
 get_regime_shifts <- function(df,l){## Calculate Anomalies in Time Series Data with rshift (STARS)
   plot_list <- list()
@@ -37,11 +64,9 @@ get_regime_shifts <- function(df,l){## Calculate Anomalies in Time Series Data w
     RSI_data <- Rodionov(data=anomaly_data, col="anomalies" , time= "date", l=l, prob = 0.05,
                          startrow = 1, merge = TRUE)
 
-    #ecoind_NA_annual$time <- 1:33
-    #Lanzante(data=ecoind_NA_annual, col="Biomass" , time= "time", p = 0.05, merge = FALSE)
 
-    RSI_graph(RSI_data, "anomalies", "date", "RSI", mean_lines = TRUE)
-    plot_list[[i]] <- recordPlot()
+
+    plot_list[[i]] <- RSI_graph_SP(RSI_data, "anomalies", "date", "RSI", mean_lines = TRUE)
 
 
   }
@@ -56,11 +81,7 @@ get_regime_shifts_raw <- function(df,l){## Calculate Anomalies in Time Series Da
     RSI_data <- Rodionov(data= df, col= i , time= "date", l=l, prob = 0.05,
                          startrow = 1, merge = TRUE)
 
-    #ecoind_NA_annual$time <- 1:33
-    #Lanzante(data=ecoind_NA_annual, col="Biomass" , time= "time", p = 0.05, merge = FALSE)
-
-    RSI_graph(RSI_data, i, "date", "RSI", mean_lines = TRUE)
-    plot_list_raw[[i]] <- recordPlot()
+    plot_list_raw[[i]] <- RSI_graph_SP(RSI_data, i, "date", "RSI", mean_lines = TRUE)
 
 
   }
@@ -73,50 +94,123 @@ ecoind_sim$Time <- ecoind_mc_grouped$Time
 ecoind_regimeshift <- as.data.frame(ecoind_sim %>%
   mutate(date = year(Time)) %>%
   group_by(date) %>%
-  summarize( med_total_B = mean(Total.B),
-             med_total_C = mean(Total.C),
-             med_TL_catch = mean(TL.catch),
-             med_TL_community = mean(TL.community)))
+  summarize( total_B = mean(Total.B),
+             total_C = mean(Total.C),
+             TL_catch = mean(TL.catch),
+             TL_community = mean(TL.community)))
 
 
 
 ## get regime shift for indicators ran with MC
 plots_mc <- get_regime_shifts(df = ecoind_regimeshift,l = 10)
 
-plots_mc$med_total_B
+plots_mc$total_B <- plots_mc$total_B + ggtitle("TBco") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,  # Center the title
+      size = 16,    # Set font size
+      face = "bold" # Make it bold
+    )
+  )
 
-plots_mc$med_total_C
+plots_mc$total_C <- plots_mc$total_C + ggtitle("TC") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,  # Center the title
+      size = 16,    # Set font size
+      face = "bold" # Make it bold
+    )
+  )
 
-plots_mc$med_TL_catch
+plots_mc$TL_catch <- plots_mc$TL_catch + ggtitle("TLc") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,  # Center the title
+      size = 16,    # Set font size
+      face = "bold" # Make it bold
+    )
+  )
 
-plots_mc$med_TL_community
+plots_mc$TL_community <- plots_mc$TL_community + ggtitle("mTLco") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,  # Center the title
+      size = 16,    # Set font size
+      face = "bold" # Make it bold
+    )
+  )
 
 ## get regime shift for indicators ran with MC
 plots_na <- get_regime_shifts(df = ecoind_NA_annual, l = 10)
 
-plots_na$TST
+plots_na$TST <- plots_na$TST + ggtitle("TST") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,  # Center the title
+      size = 16,    # Set font size
+      face = "bold" # Make it bold
+    )
+  )
 
-plots_na$IFO
+plots_na$IFO <- plots_na$IFO + ggtitle("IFO") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,  # Center the title
+      size = 16,    # Set font size
+      face = "bold" # Make it bold
+    )
+  )
 
-plots_na$FCI
+plots_na$FCI <- plots_na$FCI + ggtitle("FCI") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,  # Center the title
+      size = 16,    # Set font size
+      face = "bold" # Make it bold
+    )
+  )
 
-plots_na$OC
+plots_na$OC <- plots_na$OC + ggtitle("O/C") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,  # Center the title
+      size = 16,    # Set font size
+      face = "bold" # Make it bold
+    )
+  )
 
-plots_na$AC
+plots_na$AC <- plots_na$AC + ggtitle("A/C") +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,  # Center the title
+      size = 16,    # Set font size
+      face = "bold" # Make it bold
+    )
+  )
+
+plot_grid(plots_mc$total_B,
+          plots_mc$total_C,
+          plots_mc$TL_catch,
+          plots_mc$TL_community,
+          plots_na$TST,
+          plots_na$IFO,
+          plots_na$FCI,
+          plots_na$OC,
+          plots_na$AC, labels = NA, ncol = 3, align = 'v') +
+  theme(plot.margin = unit(c(0.5,0.5,0.5,0.5), "cm"))
 
 
-
-# raw data
+# raw data (not used)
 ## get regime shift for indicators ran with MC
 plots_mc_raw <- get_regime_shifts_raw(df = ecoind_regimeshift,l = 10)
 
-plots_mc_raw$med_total_B
+plots_mc_raw$total_B
 
-plots_mc_raw$med_total_C
+plots_mc_raw$total_C
 
-plots_mc_raw$med_TL_catch
+plots_mc_raw$TL_catch
 
-plots_mc_raw$med_TL_community
+plots_mc_raw$TL_community
 
 ## get regime shift for indicators ran with MC
 plots_na_raw <- get_regime_shifts_raw(df = ecoind_NA_annual, l = 10)

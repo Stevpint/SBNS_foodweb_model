@@ -719,8 +719,8 @@ MC_plot_param <- function(df,df2,df3,df4, var, subset_multi_FG, subset_by_specie
 EcoInd <- function(dir, dir2, calctype){
   # read eco ind files and select columns
   ecoind_mc <- read.csv(paste0(dir,"biodiv_ind_Monte Carlo.csv"), skip = 8, header = TRUE)
-  ecoind_mc <- ecoind_mc %>% select(Time,  Total.B, Total.C,
-                                    TL.catch, TL.community, Trial)
+  ecoind_mc <- ecoind_mc %>% dplyr::select(Time,  Total.B, Total.C,
+                                           TL.catch, TL.community, Trial)
 
   ecoind_mc <- ecoind_mc[which(ecoind_mc$Trial %in% as.numeric(param_mc_combined$trial)),]
 
@@ -763,8 +763,8 @@ EcoInd <- function(dir, dir2, calctype){
   }
 
   ecoind_sim <- read.csv(paste0(dir2,"biodiv_ind_Ecosim.csv"), header = TRUE, skip = 8)
-  ecoind_sim <<- ecoind_sim %>% select(Time,  Total.B, Total.C,
-                                       TL.catch, TL.community)
+  ecoind_sim <<- ecoind_sim %>% dplyr::select(Time,  Total.B, Total.C,
+                                              TL.catch, TL.community)
   # change month numbers to dates
   start_date <- as.Date("1991-01-01")   # Define start date
   monthly_sequence <- seq.Date(from = start_date, by = "month", length.out = max(ecoind_mc$Time))   # Create sequence of monthly dates
@@ -773,11 +773,11 @@ EcoInd <- function(dir, dir2, calctype){
 
   # plot (dark blue = "#354d9b", ligthblue = "#31b7bc", yellow = "#f7c97c")
   EcoInd_B_graph <<- ggplot() +
-    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_total_B, ymax = max_total_B, fill = "Total biomass"), alpha = 0.15) +
-    geom_line(data = ecoind_sim, aes(x = Time, y = Total.B, colour = "Total biomass"), linetype = "solid", linewidth = 1.5) +
-    scale_colour_manual(values = c("Total biomass" = "#31b7bc"),#"Commercial biomass" = "#354d9b",
+    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_total_B, ymax = max_total_B, fill = "TBco"), alpha = 0.15) +
+    geom_line(data = ecoind_sim, aes(x = Time, y = Total.B, colour = "TBco"), linetype = "solid", linewidth = 1.5) +
+    scale_colour_manual(values = c("TBco" = "#31b7bc"),#"Commercial biomass" = "#354d9b",
                         name = "") +
-    scale_fill_manual(values = c("Total biomass" = "#31b7bc"),#"Commercial biomass" = "#354d9b",
+    scale_fill_manual(values = c("TBco" = "#31b7bc"),#"Commercial biomass" = "#354d9b",
                       name = "") +
     theme_bw()+
     theme(
@@ -797,11 +797,11 @@ EcoInd <- function(dir, dir2, calctype){
     labs(x = "Year", y= expression(paste("Biomass (t  ",km^-2,")")))
 
   EcoInd_C_graph <<- ggplot() +
-    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_total_C, ymax = max_total_C, fill = "Total catch"), alpha = 0.15) +
-    geom_line(data = ecoind_sim, aes(x = Time, y = Total.C, colour = "Total catch"), linetype = "solid", linewidth = 1.5) +
-    scale_colour_manual(values = c("Total catch" = "#354d9b"),
+    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_total_C, ymax = max_total_C, fill = "TC"), alpha = 0.15) +
+    geom_line(data = ecoind_sim, aes(x = Time, y = Total.C, colour = "TC"), linetype = "solid", linewidth = 1.5) +
+    scale_colour_manual(values = c("TC" = "#354d9b"),
                         name = "") +
-    scale_fill_manual(values = c("Total catch" = "#354d9b"),
+    scale_fill_manual(values = c("TC" = "#354d9b"),
                       name = "") +
     theme_bw()+
     theme(
@@ -821,21 +821,21 @@ EcoInd <- function(dir, dir2, calctype){
     labs(x = "Year", y= expression(paste("Catch (t  ",km^-2,y^-1,")")))
 
   EcoInd_TL_graph <<- ggplot() +
-    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_TL_catch, ymax = max_TL_catch, fill = "TL catch"), alpha = 0.15) +
-    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_TL_community*1.5, ymax = max_TL_community*1.5, fill = "TL community"), alpha = 0.15) +
-    geom_line(data = ecoind_sim, aes(x = Time, y = TL.catch, colour = "TL catch"), linetype = "solid", linewidth = 1.5) +
-    geom_line(data = ecoind_sim, aes(x = Time, y = TL.community*1.5, colour = "TL community"), linetype = "solid", linewidth = 1.5) +
-    scale_colour_manual(values = c("TL catch" = "#354d9b", "TL community" = "#31b7bc"),
+    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_TL_catch, ymax = max_TL_catch, fill = "TLc"), alpha = 0.15) +
+    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_TL_community*1.5, ymax = max_TL_community*1.5, fill = "mTLco"), alpha = 0.15) +
+    geom_line(data = ecoind_sim, aes(x = Time, y = TL.catch, colour = "TLc"), linetype = "solid", linewidth = 1.5) +
+    geom_line(data = ecoind_sim, aes(x = Time, y = TL.community*1.5, colour = "mTLco"), linetype = "solid", linewidth = 1.5) +
+    scale_colour_manual(values = c("TLc" = "#354d9b", "mTLco" = "#31b7bc"),
                         name = NULL) +
-    scale_fill_manual(values = c("TL catch" = "#354d9b","TL community" = "#31b7bc"),
+    scale_fill_manual(values = c("TLc" = "#354d9b","mTLco" = "#31b7bc"),
                       name = NULL) +
     scale_y_continuous(
 
       # Features of the first axis
-      name = "Trophic level catch",
+      name = "Trophic level of the catch",
 
       # Add a second axis and specify its features
-      sec.axis = sec_axis( trans=~./1.5, name="Trophic level community")
+      sec.axis = sec_axis( trans=~./1.5, name="mean Trophic level of the community")
     ) +
     theme_bw() +
     theme(
@@ -862,12 +862,12 @@ ecoind_NA <- function(dir){
   ecoind_NA_annual <- ecoind_NA_annual[,-ncol(ecoind_NA_annual)]
   ecoind_NA_annual$date <- paste0(ecoind_NA_annual$Year,"-01-01")
   ecoind_NA_annual$date <-as.Date.character(ecoind_NA_annual$date)
-  ecoind_NA_annual <- ecoind_NA_annual %>% select("date",
-                                                  "Throughput", "Export", "Resp", "Prim.prod", "Prod", "Prop.flow.det",
-                                                  "Capacity", "Ascendency", "Asc.import", "Asc.flow", "Asc.export", "Asc.resp",
-                                                  "Entropy", "Ovh.import", "Ovh.flow", "Ovh.export", "Ovh.resp",
-                                                  "Biomass", "Catch",
-                                                  "FCI", "Path.length", "AMI", "TLc") ## AMI is simiar to SOI measures measures the degree of omnivory in a food web by considering the distribution of flows across different trophic levels.
+  ecoind_NA_annual <- ecoind_NA_annual %>% dplyr::select("date",
+                                                         "Throughput", "Export", "Resp", "Prim.prod", "Prod", "Prop.flow.det",
+                                                         "Capacity", "Ascendency", "Asc.import", "Asc.flow", "Asc.export", "Asc.resp",
+                                                         "Entropy", "Ovh.import", "Ovh.flow", "Ovh.export", "Ovh.resp",
+                                                         "Biomass", "Catch",
+                                                         "FCI", "Path.length", "AMI", "TLc") ## AMI is simiar to SOI measures measures the degree of omnivory in a food web by considering the distribution of flows across different trophic levels.
   #"PCI", "TLc", "Shannon.diversity.index", "FiB.index", "Det..TE..weighted.",
   #"PP.TE..weighted.", "Total.TE..weigthed."
 
@@ -881,15 +881,15 @@ ecoind_NA <- function(dir){
   ecoind_NA_annual$OC <- 1 - ecoind_NA_annual$AC
   ecoind_NA_annual$IFO <- ecoind_NA_annual$Ovh.flow
 
-  ecoind_NA_annual <<- ecoind_NA_annual %>% select("date",
-                                                   "TST", #"Ex", "R", "PP", "FD", #"Q",
-                                                   "IFO",
-                                                   "FCI",
-                                                   "OC",
-                                                   "AC",
-                                                   "Biomass",
-                                                   "Catch",
-                                                   "TLc")
+  ecoind_NA_annual <<- ecoind_NA_annual %>% dplyr::select("date",
+                                                          "TST", #"Ex", "R", "PP", "FD", #"Q",
+                                                          "IFO",
+                                                          "FCI",
+                                                          "OC",
+                                                          "AC",
+                                                          "Biomass",
+                                                          "Catch",
+                                                          "TLc")
 
 
   # monthly
@@ -906,12 +906,12 @@ ecoind_NA <- function(dir){
     }
   }
 
-  ecoind_NA_monthly <- ecoind_NA_monthly %>% select("date",
-                                                    "Throughput", "Export", "Resp", "Prim.prod", "Prod", "Prop.flow.det",
-                                                    "Capacity", "Ascendency", "Asc.import", "Asc.flow", "Asc.export", "Asc.resp",
-                                                    "Entropy", "Ovh.import", "Ovh.flow", "Ovh.export", "Ovh.resp",
-                                                    "Biomass", "Catch",
-                                                    "FCI", "Path.length", "AMI", "TLc") ## AMI is similar to SOI measures measures the degree of omnivory in a food web by considering the distribution of flows across different trophic levels.
+  ecoind_NA_monthly <- ecoind_NA_monthly %>% dplyr::select("date",
+                                                           "Throughput", "Export", "Resp", "Prim.prod", "Prod", "Prop.flow.det",
+                                                           "Capacity", "Ascendency", "Asc.import", "Asc.flow", "Asc.export", "Asc.resp",
+                                                           "Entropy", "Ovh.import", "Ovh.flow", "Ovh.export", "Ovh.resp",
+                                                           "Biomass", "Catch",
+                                                           "FCI", "Path.length", "AMI", "TLc") ## AMI is similar to SOI measures measures the degree of omnivory in a food web by considering the distribution of flows across different trophic levels.
   #"PCI", "TLc", "Shannon.diversity.index", "FiB.index", "Det..TE..weighted.",
   #"PP.TE..weighted.", "Total.TE..weigthed."
 
@@ -925,15 +925,15 @@ ecoind_NA <- function(dir){
   ecoind_NA_monthly$OC <- 1 - ecoind_NA_monthly$AC
   ecoind_NA_monthly$IFO <- ecoind_NA_monthly$Ovh.flow
 
-  ecoind_NA_monthly <<- ecoind_NA_monthly %>% select("date",
-                                                     "TST", #"Ex", "R", "PP", "FD", #"Q",
-                                                     "IFO",
-                                                     "FCI",
-                                                     "OC",
-                                                     "AC",
-                                                     "Biomass",
-                                                     "Catch",
-                                                     "TLc")
+  ecoind_NA_monthly <<- ecoind_NA_monthly %>% dplyr::select("date",
+                                                            "TST", #"Ex", "R", "PP", "FD", #"Q",
+                                                            "IFO",
+                                                            "FCI",
+                                                            "OC",
+                                                            "AC",
+                                                            "Biomass",
+                                                            "Catch",
+                                                            "TLc")
 }
 ecoind_NA_plot <- function(dataset){
   ecoind_NA_annual$OC <- ecoind_NA_annual$OC  *100
