@@ -10,7 +10,7 @@ require("ggtext")
 require("data.table")
 
 
-# functions   ------------------------------------------------------------------
+# functions   ------------------------------------------------------------------data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAAAbElEQVR4Xs2RQQrAMAgEfZgf7W9LAguybljJpR3wEse5JOL3ZObDb4x1loDhHbBOFU6i2Ddnw2KNiXcdAXygJlwE8OFVBHDgKrLgSInN4WMe9iXiqIVsTMjH7z/GhNTEibOxQswcYIWYOR/zAjBJfiXh3jZ6AAAAAElFTkSuQmCC
 # delete part of the directory for option names
 replace_fun <- function(x) { sub("^.{1,144}", "",x)} # Rename each file by removing the first 124 characters of the filename
 # get all the options in the output of MC
@@ -31,6 +31,26 @@ assign_class <- function(df){
     df$class[which(df$species == sp)] <- classes$class[which(classes$Group.name == sp)]
   }
   return(df)
+}
+# omit outside the limits
+outside_limits <- function(fd_MC_limits,df,var){
+  # read csv file with class assigned to FG
+  limits <- read.csv(paste0(fd_MC_limits,"MC_",var,"_limits.csv"), sep = ',', header = TRUE)
+  limits <- limits[,-c(1,7)]
+  limits <- na.omit(limits)
+
+  # find trials out of limits based on csv file
+  outliers <- NULL
+  for (sp in unique(limits$Group.name)){
+    x <- subset(df,species == sp & year == "1991-01-01")
+    trial_out <- x$trial[which(x$param < limits$Lower.limit[which(limits$Group.name==sp)]|x$param > limits$Upper.limit[which(limits$Group.name==sp)])]
+
+    # Find outliers
+    outliers <- c(outliers,trial_out)
+
+  }
+
+  return(outliers)
 }
 #select best 90% fits
 SS_MC <- function(fd_MC, total_trials, percentage) {
@@ -79,6 +99,31 @@ SS_MC <- function(fd_MC, total_trials, percentage) {
   ss_mc_90 <- ss_mc_90[1:n90, ]
 
   return(ss_mc_90)
+}
+# find outliers, ie crazy starting values
+get_outlier <- function(df){
+
+  outliers_df <- data.frame("year" = NA,   "param" = NA,  "species" = NA, "trial" = NA)
+
+  for (sp in unique(df$species)){
+    x <- subset(df,species == sp & year == "1991")
+    x <- na.omit(x)
+    # Calculate IQR
+    Q1 <- quantile(x$param, 0.25, na.rm = TRUE)  # First quartile (25%)
+    Q3 <- quantile(x$param, 0.75, na.rm = TRUE)  # Third quartile (75%)
+    IQR_value <- IQR(x$param)      # Interquartile range
+
+    # Define lower and upper bounds for outliers
+    lower_bound <- Q1 - 1.5 * IQR_value
+    upper_bound <- Q3 + 1.5 * IQR_value
+
+    # Find outliers
+    outliers <- x[x$param < lower_bound | x$param > upper_bound,]
+
+    outliers_df <- rbind(outliers_df,outliers)
+  }
+  outliers_df <- na.omit(outliers_df)
+  return(outliers_df)
 }
 # retrieve MC output of specific option (eg biomass) -> output of functions is a df with all data for selected option
 param_MC <- function(param){
@@ -643,7 +688,7 @@ MC_plot_param <- function(df,df2,df3,df4, var, subset_multi_FG, subset_by_specie
     #geom_line(data = df3, aes(x = as.Date(year), y = param, colour = class, linetype = "dashed"), linewidth = 1.5 ) + # our fit line
     geom_point(data = df4, aes(x = as.Date(year), y = param, shape = "A"), colour = "#354d9b", size = 2) +  # TS data
     geom_ribbon(data = df, aes(x= as.Date(year), ymin = min, ymax = max, fill= "#354d9b"),  alpha = 0.15) +
-    facet_wrap(vars(species), ncol = 3, scales = "free_y")+
+    facet_wrap(vars(species), ncol = 4, scales = "free_y")+
     scale_fill_manual(values = "#354d9b",
                       labels = "confidence interval" ,
                       name = NULL)+
@@ -777,13 +822,21 @@ EcoInd <- function(dir, dir2, calctype){
 
   EcoInd_TL_graph <<- ggplot() +
     geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_TL_catch, ymax = max_TL_catch, fill = "TL catch"), alpha = 0.15) +
-    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_TL_community, ymax = max_TL_community, fill = "TL community"), alpha = 0.15) +
+    geom_ribbon(data = ecoind_mc_grouped, aes(x = Time, ymin = min_TL_community*1.5, ymax = max_TL_community*1.5, fill = "TL community"), alpha = 0.15) +
     geom_line(data = ecoind_sim, aes(x = Time, y = TL.catch, colour = "TL catch"), linetype = "solid", linewidth = 1.5) +
-    geom_line(data = ecoind_sim, aes(x = Time, y = TL.community, colour = "TL community"), linetype = "solid", linewidth = 1.5) +
+    geom_line(data = ecoind_sim, aes(x = Time, y = TL.community*1.5, colour = "TL community"), linetype = "solid", linewidth = 1.5) +
     scale_colour_manual(values = c("TL catch" = "#354d9b", "TL community" = "#31b7bc"),
                         name = NULL) +
     scale_fill_manual(values = c("TL catch" = "#354d9b","TL community" = "#31b7bc"),
                       name = NULL) +
+    scale_y_continuous(
+
+      # Features of the first axis
+      name = "Trophic level catch",
+
+      # Add a second axis and specify its features
+      sec.axis = sec_axis( trans=~./1.5, name="Trophic level community")
+    ) +
     theme_bw() +
     theme(
       text = element_text(size = 10),
@@ -993,17 +1046,49 @@ subset_by_class <- NA # if not required = NA
 
 # you can select several species or classes by adjusting the function to subset the df with only the preferred species/classes
 multiple_FGs <- "yes" # "yes" or "no"
-specific_subset <- function(df){subset(df,species == "Cod (adult)"|
+specific_subset <- function(df){subset(df,species == "Harbour porpoise"|
+                                         species == "Seals"|
+                                         species == "Seabirds (discard)"|
+                                         species == "Seabirds (non-discard)"|
+                                         species ==  "Sharks"|
+                                         species ==  "Rays"|
+                                         species ==  "Juvenile Cod"|
+                                         species ==  "Cod (adult)"|
+                                         species ==  "Juvenile Whiting"|
+                                         species ==  "Whiting (adult)"|
+                                         species ==   "Other gadoids"|
+                                         species ==  "Demersal fish"|
+                                         species ==  "Juvenile Herring"|
                                          species == "Herring (adult)"|
-                                         species == "Whiting (adult)"|
-                                         species == "Plaice (adult)"|
-                                         species == "Sole (adult)"|
                                          species == "Sprat"|
-                                         species == "Mackerel"|
-                                         species == "Horse mackerel"|
-                                         species == "Sandeels"|
-
-                                         species == "Dab")
+                                         species ==  "Mackerel"|
+                                         species ==  "Horse mackerel"|
+                                         species ==  "Sandeels"|
+                                         species ==  "Juvenile Plaice"|
+                                         species ==  "Plaice (adult)"|
+                                         species == "Dab"|
+                                         species ==  "Other flatfish"|
+                                         species ==  "Juvenile Sole"|
+                                         species == "Sole (adult)"|
+                                         species ==  "Sea Bass"|
+                                         species ==  "Pelagic fish"|
+                                         species == "Squid & cuttlefish"|
+                                         species ==  "Carnivorous zooplankton"|
+                                         species ==  "Herbivorous plankton (copepods)"|
+                                         species == "Gelatinous zooplankton"|
+                                         species ==  "Large crabs + shrimps"|
+                                         species == "Blue mussels (reefs)"|
+                                         species == "Blue mussels (aquaculture)"|
+                                         species ==  "Epifaunal macrobenthos (mobile grazers)"|
+                                         species == "Infaunal macrobenthos"|
+                                         species == "Crangon"|
+                                         species == "Small mobile epifauna (swarming crustaceans)"|
+                                         species ==  "Small infauna (polychaetes)"|
+                                         species ==   "Sessile epifauna"|
+                                         species ==  "Meiofauna"|
+                                         species ==  "Phytoplankton"|
+                                         species ==  "Detritus"|
+                                         species == "Discards")
 }
 
 
@@ -1042,7 +1127,7 @@ ecoind_NA_annual
 ecoind_NA_monthly
 
 EcoInd_NA <- ecoind_NA_plot("annual") # annual or monthly
-plot_grid(EcoInd_NA[[1]], EcoInd_NA[[2]], EcoInd_NA[[3]], EcoInd_NA[[4]], EcoInd_NA[[5]], labels = "AUTO", ncol = 5, align = 'h') +
+plot_grid(EcoInd_NA[[1]], EcoInd_NA[[2]], EcoInd_NA[[3]], EcoInd_NA[[4]], EcoInd_NA[[5]], labels = "AUTO", ncol = 2, align = 'h') +
   theme(plot.margin = unit(c(0.5,0.5,0.5,0.5), "cm"))
 
 write.csv(ecoind_NA_annual, "C:/Users/stevenp/OneDrive - VLIZ/Documents/stevenp/Ecopath with Ecosim/Manuscripts/Ecosim paper/annual_eco_ind.csv")
