@@ -1120,7 +1120,7 @@ ecoind_mc_grouped$Time <- monthly_sequence
 plot_grid(EcoInd_B_graph, EcoInd_C_graph, EcoInd_TL_graph, labels = "AUTO", ncol = 3, align = 'v') +
   theme(plot.margin = unit(c(0.5,0.5,0.5,0.5), "cm"))
 
-# analyse eco ind that come from Network analysis and not ran wit MC
+# analyse eco ind that come from Network analysis and not ran with MC
 fd_ecoind_NA <- "C:/Users/stevenp/OneDrive - VLIZ/Documents/EwE output/SBNS_1991_2023_V17_TechnicalReport/ecosim_V15_TechnicalReport/"
 ecoind_NA(fd_ecoind_NA)
 ecoind_NA_annual
