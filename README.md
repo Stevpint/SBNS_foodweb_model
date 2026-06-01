@@ -38,7 +38,7 @@ The food web model developed in EwE was used to assess the historical dynamics o
 - Pint, S.; Stevens, M.; Musimwa, R.; Standaert, W.; De Troch, M.; van Oevelen, D.; Heymans, J.J.; Everaert, G. (2024) A food web model of the Southern Bight of the   North   Sea. Ocean & Coastal Management. Volume 255. 107256. ISSN 0964-5691. https://doi.org/10.1016/j.ocecoaman.2024.107256.
 - Pint S., Lorré D., Stevens M., De Troch M., Heymans S., van   Oevelen D., Musimwa R., Everaert G. (in prep.) Historical dynamics of the Southern Bight of the        North Sea (1991–2023): A food web modelling approach.
 - Pint, S.; Stevens, M.; De Troch, M.; van Oevelen, D.; Heymans, J.J.; Everaert, G. (2024). Ecopath model of the Southern Bight of the North Sea. Version 3.           Flanders Marine Institute (VLIZ): Ostend. 37 pp. https://dx.doi.org/10.48470/74.
-- Pint, S.; Lorré, D.; Stevens, M.; De Troch, M.; van Oevelen, D.; Heymans, J.J.; Everaert, G. (in prep). Ecopath model of the Southern Bight of the North Sea.        Version 4. Flanders Marine Institute (VLIZ): Ostend.
+- Pint, S.; Lorré, D.; Stevens, M.; De Troch, M.; Heymans, S.; van Oevelen, D.; Everaert, G. (2026). Ecopath with Ecosim model of the Southern Bight of the North Sea. Version 4. Flanders Marine Institute (VLIZ): Ostend. 55 pp. https://dx.doi.org/10.48470/129
 
 ## Data availability
 - INCLUDE RECENT RESULTS LINK
