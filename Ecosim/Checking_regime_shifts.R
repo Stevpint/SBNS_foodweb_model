@@ -1,8 +1,7 @@
 # Load required packages
 library(forecast)
-library(nlme)
 #install.packages('rshift', repos = c('https://alexhroom.r-universe.dev', 'https://cloud.r-project.org'), type='binary' )
-
+library(cowplot)
 library(rshift)
 library(dplyr)
 library(lubridate)
@@ -11,7 +10,7 @@ library(ggplot2)
 library(MASS)
 ## function RSI_graph adjusted
 RSI_graph_SP <- function (data, col, time, rsi, mean_lines = FALSE){
-  p1 <- ggplot(data) + geom_col(aes(x = .data[[time]], y = .data[[col]]))+
+  p1 <- ggplot(data) + geom_col(aes(x = .data[[time]], y = .data[[col]]), color = "grey", fill = "grey")+
       theme_bw()+
       theme(
         text = element_text(size = 10),
@@ -25,8 +24,9 @@ RSI_graph_SP <- function (data, col, time, rsi, mean_lines = FALSE){
     labs(x = 'Year', y = "Anomalies")
   if (mean_lines) {
     means <- rshift::regime_means(data, col, rsi)
+    means <- c(means[1:30], NA, NA, NA)
     p1 <- p1 + geom_line(aes(x = .data[[time]], y = means),
-                         color = "red")
+                         color = "#354d9b",linewidth = 1)
   }
   p2 <- ggplot(data) + geom_col(aes(x = .data[[time]], y = .data[[rsi]]))
   grid::pushViewport(grid::viewport(layout = grid::grid.layout(2,
