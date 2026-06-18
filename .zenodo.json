@@ -52,5 +52,17 @@
     "language": "eng",
     "grants": [
         {"id": "101112823"}
+    ],
+    "related_identifiers": [
+        {
+            "identifier": "https://doi.org/10.48470/129",
+            "relation": "isSupplementTo",
+            "scheme": "doi"
+        },
+        {
+            "identifier": "https://doi.org/10.1016/j.ocecoaman.2024.107256",
+            "relation": "isSupplementTo",
+            "scheme": "doi"
+        }
     ]
 }
