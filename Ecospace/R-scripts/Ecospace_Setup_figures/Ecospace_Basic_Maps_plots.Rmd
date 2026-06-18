@@ -1,0 +1,386 @@
+---
+title: "Ecospace_Basic_Maps_Plots"
+author: "Dries Lorré"
+date: "2026-03-19"
+output: html_document
+---
+
+In this script, we PLOT the basic maps used for ecospace initiation. Initial processing of these data is covered in the RStudio script "Input_layers_processing.rdm" under project "Spatial_Input_layers_processing"
+
+Packages
+```{r}
+library(terra)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(grid)
+```
+
+Directories
+```{r}
+# HABITATS
+hab_coarse <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/Folk5_CoarseSed.asc"
+hab_mixed  <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/Folk5_MixedSed.asc"
+hab_mud    <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/Folk5_Mud_MuddySand.asc"
+hab_rock   <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/Folk5_RockBoulders.asc"
+hab_sand   <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/Folk5_Sand.asc"
+
+# DISTANCE TO LAND
+dist_file <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/DistCoast_km.asc"
+
+# BATHYMETRY
+depth_file <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/Depth.asc"
+
+# COASTAL - MARINE
+coastmarine_file <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/CoastalMarine_Seabirds.asc"
+
+# RELATIVE PRIMARY PRODUCTION
+rpp_file <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/RPP_relative_yearly/RPP_rel_1991.asc"
+
+# TEMPERATURE
+temp_file <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/Temperature/Baseline/Temp_Baseline_1991.asc"
+
+# SALINITY
+sal_file <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data/Processed/Salinity/Baseline/Sal_Baseline_1991.asc"
+
+# LAND SHAPEFILE / RDS
+# Use whichever one you prefer
+land_file_rds <- "land_main_study_area.rds"
+# land_file_shp <- "LAND_MASS.shp"
+
+# OUTPUT DIRECTORY
+out_dir <- "Plots_basic_input_layers"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+```
+
+Reference raster and land polygon
+```{r}
+ref_rast <- rast(depth_file)
+
+land_main <- readRDS(land_file_rds)
+
+# If needed, reproject land to raster CRS
+if (!st_crs(land_main)$wkt == crs(ref_rast)) {
+  land_main <- st_transform(land_main, crs(ref_rast))
+}
+```
+
+
+Helper functions
+```{r}
+raster_to_df <- function(r, varname = "value", zero_to_na = TRUE) {
+  df <- as.data.frame(r, xy = TRUE, na.rm = FALSE)
+  names(df) <- c("x", "y", varname)
+
+  if (zero_to_na) {
+    df[[varname]][df[[varname]] == 0] <- NA
+  }
+
+  df
+}
+
+base_map_theme <- function() {
+  theme_bw(base_size = 11) +
+    theme(
+      axis.title = element_text(size = 14),
+      axis.text = element_text(size = 14),
+      legend.title = element_text(size = 13),
+      legend.text = element_text(size = 13),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      legend.position = "right",
+
+      # optional cleanup
+      # legend.key = element_rect(fill = "white", colour = NA),
+
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+      plot.margin = margin(2, 2, 2, 2)
+    )
+}
+
+add_common_map_layout <- function(p, df) {
+  p +
+    geom_sf(
+      data = land_main,
+      inherit.aes = FALSE,
+      fill = "grey85",
+      colour = "grey45",
+      linewidth = 0.2
+    ) +
+    coord_sf(expand = FALSE) +
+    scale_x_continuous(
+      breaks = pretty(range(df$x, na.rm = TRUE), n = 3),
+      name = "Longitude"
+    ) +
+    scale_y_continuous(
+      breaks = pretty(range(df$y, na.rm = TRUE), n = 3),
+      name = "Latitude"
+    ) +
+    base_map_theme()
+}
+
+make_continuous_map <- function(df, value_col, title, colours, legend_title = NULL, labels_fun = waiver()) {
+  
+  panel_min <- quantile(df[[value_col]], probs = 0.001, na.rm = TRUE)
+  panel_max <- quantile(df[[value_col]], probs = 0.999, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- min(df[[value_col]], na.rm = TRUE)
+  if (!is.finite(panel_max)) panel_max <- max(df[[value_col]], na.rm = TRUE)
+  if (!is.finite(panel_min)) panel_min <- 0
+  if (!is.finite(panel_max)) panel_max <- 1
+  
+  if (panel_min == panel_max) panel_max <- panel_min + 1e-6
+  
+  p <- ggplot(df, aes(x = x, y = y, fill = .data[[value_col]])) +
+    geom_raster() +
+    scale_fill_gradientn(
+      colours = colours,
+      limits = c(panel_min, panel_max),
+      oob = scales::squish,
+      breaks = pretty(c(panel_min, panel_max), n = 3),
+      labels = labels_fun,
+      na.value = "white",
+      name = legend_title,
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(35, "mm"),
+        barwidth = unit(6, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(title = title)
+  
+  add_common_map_layout(p, df)
+}
+
+make_categorical_map <- function(df, value_col, title, values_named) {
+  
+  p <- ggplot(df, aes(x = x, y = y, fill = .data[[value_col]])) +
+    geom_raster() +
+    scale_fill_manual(
+      values = values_named,
+      na.value = "white",
+      na.translate = FALSE,
+      guide = guide_legend(
+        title.position = "top",
+        keyheight = unit(6, "mm"),
+        keywidth = unit(6, "mm")
+      )
+    ) +
+    labs(title = title)
+  
+  add_common_map_layout(p, df)
+}
+
+```
+
+Load rasters
+```{r}
+# Habitat rasters
+r_coarse <- rast(hab_coarse)
+r_mixed  <- rast(hab_mixed)
+r_mud    <- rast(hab_mud)
+r_rock   <- rast(hab_rock)
+r_sand   <- rast(hab_sand)
+# Other
+r_dist        <- rast(dist_file)
+r_depth       <- rast(depth_file)
+r_coastmarine <- rast(coastmarine_file)
+r_rpp         <- rast(rpp_file)
+r_temp        <- rast(temp_file)
+r_sal         <- rast(sal_file)
+```
+
+Habitat map
+```{r}
+hab_stack <- c(r_coarse, r_mixed, r_mud, r_rock, r_sand)
+names(hab_stack) <- c(
+  "Coarse sediment",
+  "Mixed sediment",
+  "Mud / muddy sand",
+  "Rock / boulders",
+  "Sand"
+)
+
+hab_df <- as.data.frame(hab_stack, xy = TRUE, na.rm = FALSE)
+
+hab_cols <- c(
+  "Coarse sediment",
+  "Mixed sediment",
+  "Mud / muddy sand",
+  "Rock / boulders",
+  "Sand"
+)
+
+# classify strictly on presence == 1
+hab_df$habitat <- NA_character_
+
+hab_df$habitat[hab_df$`Coarse sediment` == 1] <- "Coarse sediment"
+hab_df$habitat[hab_df$`Mixed sediment`  == 1] <- "Mixed sediment"
+hab_df$habitat[hab_df$`Mud / muddy sand` == 1] <- "Mud / muddy sand"
+hab_df$habitat[hab_df$`Rock / boulders` == 1] <- "Rock / boulders"
+hab_df$habitat[hab_df$`Sand` == 1] <- "Sand"
+
+hab_df$habitat <- factor(hab_df$habitat, levels = hab_cols)
+
+habitat_cols <- c(
+  "Coarse sediment" = "#b2182b",
+  "Mixed sediment" = "#ef8a62",
+  "Mud / muddy sand" = "#99804d",
+  "Rock / boulders" = "#636363",
+  "Sand" = "#fee08b"
+)
+
+p_habitat <- make_categorical_map(
+  df = hab_df[, c("x", "y", "habitat")],
+  value_col = "habitat",
+  title = "Habitat types",
+  values_named = habitat_cols
+) 
+
+p_habitat
+
+```
+
+Distance to land map
+```{r}
+dist_df <- raster_to_df(r_dist, "dist_km")
+
+p_dist <- make_continuous_map(
+  df = dist_df,
+  value_col = "dist_km",
+  title = "Distance to land",
+  colours = c("khaki1", "goldenrod1", "orange", "tomato", "firebrick"),
+  legend_title = "[km]"
+)
+
+p_dist
+
+# --> add legend text "[km]"
+```
+
+Bathymetry map
+```{r}
+depth_df <- raster_to_df(r_depth, "depth")
+
+p_depth <- make_continuous_map(
+  df = depth_df,
+  value_col = "depth",
+  title = "Bathymetry",
+  colours = c("white", "lightcyan", "lightskyblue", "deepskyblue3", "steelblue4", "midnightblue"),
+  legend_title = "[m]"
+)
+
+p_depth
+
+# --> add legend text "[m]"
+```
+
+Coastal - Marine map
+```{r}
+coastmarine_df <- raster_to_df(r_coastmarine, "zone") %>%
+  mutate(
+    zone_class = case_when(
+      is.na(zone) ~ NA_character_,
+      zone == 1 ~ "Coastal",
+      zone == 0.75 ~ "Marine",
+      TRUE ~ as.character(zone)
+    )
+  )
+
+coastmarine_df$zone_class <- factor(coastmarine_df$zone_class, levels = c("Coastal", "Marine"))
+
+p_coastmarine <- make_categorical_map(
+  df = coastmarine_df %>% select(x, y, zone_class),
+  value_col = "zone_class",
+  title = "Coastal–marine classification",
+  values_named = c(
+    "Coastal" = "#fee07b",
+    "Marine" = "#888eb8"
+  )
+) + theme(legend.title = element_blank())
+
+p_coastmarine 
+```
+
+Relative primary production map
+```{r}
+rpp_df <- raster_to_df(r_rpp, "rpp")
+
+p_rpp <- make_continuous_map(
+  df = rpp_df,
+  value_col = "rpp",
+  title = "Relative primary production",
+  colours = c("white", "palegreen", "yellowgreen", "forestgreen", "darkgreen")
+)
+
+p_rpp
+```
+
+Temperature map 
+```{r}
+temp_df <- raster_to_df(r_temp, "temp")
+
+p_temp <- make_continuous_map(
+  df = temp_df,
+  value_col = "temp",
+  title = "Sea Surface Temperature (1991 - average)",
+  colours = c("navy", "dodgerblue3", "deepskyblue", "gold", "orange", "red3"),
+  legend_title = "[°C]"
+)
+
+p_temp
+
+# --> add legend text "[°C]"
+```
+
+Salinity map
+```{r}
+sal_df <- raster_to_df(r_sal, "sal")
+
+p_sal <- make_continuous_map(
+  df = sal_df,
+  value_col = "sal",
+  title = "Sea Surface Salinity (1991 - average)",
+  colours = c("lightyellow", "khaki1", "gold", "orange", "brown4"),
+  legend_title = "[psu]"
+)
+
+p_sal
+
+# --> add legend text "[psu]"
+```
+
+Overview plot
+```{r}
+overview_plot <- (
+  p_habitat + p_dist +
+  p_depth + p_coastmarine +
+  p_rpp + p_temp +
+  p_sal + plot_spacer()
+) +
+  plot_layout(ncol = 2) +
+  plot_annotation(
+    title = NULL,
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 15, hjust = 0.5)
+    )
+  )
+
+overview_plot
+
+# Save overview figure
+ggsave(
+  file.path(out_dir, "Overview_basic_Ecospace_input_layers.png"),
+  overview_plot,
+  width = 14,
+  height = 17,
+  dpi = 800
+)
+```
+

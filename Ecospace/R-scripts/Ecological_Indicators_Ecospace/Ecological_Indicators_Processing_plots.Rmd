@@ -1,0 +1,2338 @@
+---
+title: "Ecological_Indicator_Processing_plots"
+author: "Dries Lorré"
+date: "2026-03-12"
+output: html_document
+---
+
+In this script, the data of ecological indicators are processed and plotted.
+
+Packages
+```{r}
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(readr)
+library(purrr)
+library(tidyr)
+library(patchwork)
+library(scales)
+library(sf)
+library(terra)
+```
+
+Directories
+```{r}
+scenario_dirs <- c(
+  Baseline  = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_baseline_test",
+  CC        = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_CC_test",
+  OWF       = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_test",
+  OWF_CC    = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_CC_test"
+)
+
+csv_subfolder <- "Test_Env_resps"
+
+out_dir <- file.path(getwd(), "Ecological_indicator_plots")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# load pre-cropped land object
+land_main <- readRDS(
+  "land_main_study_area.rds"
+)
+land_main_df <- land_main |>
+  st_cast("MULTIPOLYGON") |>
+  st_cast("POLYGON") |>
+  mutate(poly_id = row_number())
+
+land_main_df_plot <- do.call(
+  rbind,
+  lapply(seq_len(nrow(land_main_df)), function(i) {
+    coords <- st_coordinates(land_main_df[i, ])
+    data.frame(
+      x = coords[, 1],
+      y = coords[, 2],
+      poly_id = i
+    )
+  })
+)
+# use one reference raster to guarantee identical CRS to the plotted rasters
+# ref_rast <- rast("OWF_MPA_2150.asc")
+# crs(ref_rast)
+# crs(land_main)
+# reproject land to raster CRS
+# land_main <- st_transform(land_main, crs(ref_rast))
+```
+
+Setting up targets
+```{r}
+# last 10 yearly outputs
+target_steps <- seq(1812, 1920, by = 12)
+
+# folder inside each scenario directory
+csv_subfolder <- "Test_Env_resps"
+
+# indicator groups for the baseline figure
+indicator_groups <- list(
+  "Biomass-based" = c(
+    "Total B",
+    "Commercial B",
+    "Fish B",
+    "Invertebrates B",
+    "Demersal B",
+    "Pelagic B"
+  ),
+  "Catch-based" = c(
+    "Total C",
+    "Fish C",
+    "Invertebrate C",
+    "Demersal C",
+    "Pelagic C"
+  ),
+  "Trophic level-based" = c(
+    "TL community",
+    "TL community 3,25",
+    "TL catch"
+  )
+)
+
+# flattened order
+selected_indicators <- unlist(indicator_groups, use.names = FALSE)
+```
+
+Helper functions
+```{r}
+extract_step <- function(x) {
+  as.integer(stringr::str_extract(basename(x), "(?<=Ecospace)\\d+(?=\\.csv$)"))
+}
+
+get_csv_dir <- function(scenario_path) {
+  file.path(scenario_path, csv_subfolder)
+}
+
+list_target_csvs <- function(scenario_path, steps = target_steps) {
+  csv_dir <- get_csv_dir(scenario_path)
+  
+  files <- list.files(
+    csv_dir,
+    pattern = "^biodiv_ind_Ecospace\\d+\\.csv$",
+    full.names = TRUE
+  )
+  
+  tibble(file = files) %>%
+    mutate(step = extract_step(file)) %>%
+    filter(step %in% steps) %>%
+    arrange(step)
+}
+
+read_indicator_csv <- function(file) {
+  readr::read_csv(file, show_col_types = FALSE)
+}
+```
+
+Baseline scenario: processing
+```{r}
+baseline_files <- list_target_csvs(scenario_dirs["Baseline"])
+
+baseline_raw <- lapply(seq_len(nrow(baseline_files)), function(i) {
+  df <- read_indicator_csv(baseline_files$file[i])
+  df$step <- baseline_files$step[i]
+  df
+}) %>%
+  bind_rows()
+
+# quick check: are all requested indicators present?
+missing_indicators <- setdiff(selected_indicators, names(baseline_raw))
+missing_indicators
+```
+
+```{r}
+baseline_mean <- baseline_raw %>%
+  select(Column, Row, Lon, Lat, step, all_of(selected_indicators)) %>%
+  group_by(Column, Row, Lon, Lat) %>%
+  summarise(
+    across(all_of(selected_indicators), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+baseline_long <- baseline_mean %>%
+  pivot_longer(
+    cols = all_of(selected_indicators),
+    names_to = "indicator",
+    values_to = "value"
+  ) %>%
+  mutate(
+    indicator = factor(indicator, levels = selected_indicators)
+  )
+```
+
+Baseline: subplot function
+```{r}
+make_baseline_indicator_subplot <- function(df_panel,
+                                            show_x = FALSE,
+                                            show_y = FALSE) {
+    
+  # ensure full raster grid (this is the fix)
+  df_panel <- df_panel %>%
+    tidyr::complete(
+      Lon = unique(Lon),
+      Lat = unique(Lat)
+    )
+  
+  # panel-specific limits
+  panel_min <- quantile(df_panel$value, probs = 0.01, na.rm = TRUE)
+  panel_max <- quantile(df_panel$value, probs = 0.99, na.rm = TRUE)
+  
+  # safeguard
+  if (!is.finite(panel_min)) panel_min <- 0
+  if (!is.finite(panel_max)) panel_max <- max(df_panel$value, na.rm = TRUE)
+  
+  if (panel_min == panel_max) {
+    panel_max <- panel_min + 1e-6
+  }
+  
+  # squish values above the chosen upper limit into the top color
+  p <- ggplot(df_panel, aes(x = Lon, y = Lat, fill = value)) +
+    geom_raster() +
+geom_polygon(
+  data = land_main_df_plot,
+  aes(x = x, y = y, group = poly_id),
+  inherit.aes = FALSE,
+  fill = "grey85",
+  colour = "grey45",
+  linewidth = 0.2
+) +
+coord_equal(expand = FALSE) +
+    scale_x_continuous(breaks = pretty(range(df_panel$Lon, na.rm = TRUE), n = 3)) +
+    scale_y_continuous(breaks = pretty(range(df_panel$Lat, na.rm = TRUE), n = 3)) +
+    scale_fill_distiller(
+      palette = "Spectral",
+      direction = -1,
+      limits = c(panel_min, panel_max),
+      oob = scales::squish,
+      breaks = pretty(c(panel_min, panel_max), n = 3),
+      na.value = "white",
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(15, "mm"),
+        barwidth  = unit(5, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(
+      fill = NULL,
+      x = if (show_x) "Longitude" else NULL,
+      y = if (show_y) "Latitude" else NULL
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 11),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      legend.position = c(0.98, 0.02),
+      legend.justification = c(1, 0),
+      legend.box.background = element_rect(
+        colour = "black",
+        fill = scales::alpha("white", 0.75)
+      ),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0.75),
+        colour = NA
+      ),
+      plot.margin = margin(2, 2, 2, 2)
+    )
+  
+  if (!show_x) {
+    p <- p + theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  }
+  
+  if (!show_y) {
+    p <- p + theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+  }
+  
+  p
+}
+```
+
+Baseline: grouped plot
+```{r}
+plot_grouped_baseline_figure <- function(df_long, indicator_groups, out_dir,
+                                         filename = "Baseline_ecological_indicators.png",
+                                         width = 13, height = 16) {
+  
+  group_blocks <- list()
+  group_heights <- c()
+  
+  for (grp_name in names(indicator_groups)) {
+    
+    inds <- indicator_groups[[grp_name]]
+    df_grp <- df_long %>% filter(indicator %in% inds)
+    
+    n_inds <- length(inds)
+    ncol <- 3
+    n_rows_used <- ceiling(n_inds / ncol)
+    
+    # -----------------------------
+    # group title row
+    # -----------------------------
+    group_title <- ggplot() +
+      annotate("text",
+               x = 0.02, y = 0.15,
+               label = grp_name,
+               hjust = 0,
+               fontface = "bold",
+               size = 6) +
+      coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), clip = "off") +
+      theme_void() +
+      theme(
+        plot.margin = margin(0, 0, -4, 0)
+      )
+    
+    # -----------------------------
+    # indicator blocks
+    # -----------------------------
+    indicator_blocks <- lapply(seq_along(inds), function(i) {
+      ind <- inds[i]
+      df_panel <- df_grp %>% filter(indicator == ind)
+      
+      row_pos <- ceiling(i / ncol)
+      col_pos <- i %% ncol
+      if (col_pos == 0) col_pos <- ncol
+      
+      ind_title <- ggplot() +
+        annotate("text",
+                 x = 0.02, y = 0.05,
+                 label = ind,
+                 hjust = 0,
+                 fontface = "bold",
+                 size = 4.6) +
+        coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), clip = "off") +
+        theme_void() +
+        theme(
+          plot.margin = margin(0, 0, -8, 0)
+        )
+      
+      map_plot <- make_baseline_indicator_subplot(
+        df_panel,
+        show_x = row_pos == n_rows_used,
+        show_y = col_pos == 1
+      )
+      
+      ind_title / map_plot + plot_layout(heights = c(0.02, 0.1))
+    })
+    
+    maps_block <- wrap_plots(
+      indicator_blocks,
+      ncol = ncol,
+      nrow = n_rows_used
+    )
+    
+    # group block: title row + maps
+    group_block <- group_title / maps_block +
+      plot_layout(heights = c(0.035, 1))
+    
+    group_blocks[[grp_name]] <- group_block
+    group_heights <- c(group_heights, n_rows_used)
+  }
+  
+  final_plot <- wrap_plots(group_blocks, ncol = 1) +
+    plot_layout(heights = group_heights)
+  
+  print(final_plot)
+  
+  ggsave(
+    filename = file.path(out_dir, filename),
+    plot = final_plot,
+    width = width,
+    height = height,
+    dpi = 800
+  )
+  
+  final_plot
+}
+```
+
+Baseline figure
+```{r}
+baseline_indicator_figure <- plot_grouped_baseline_figure(
+  df_long = baseline_long,
+  indicator_groups = indicator_groups,
+  out_dir = out_dir,
+  filename = "Baseline_ecological_indicators.png",
+  width = 13,
+  height = 16
+)
+```
+----------------------------------------------------------
+SCENARIO PLOTS
+
+First process all scenario's
+```{r}
+process_scenario_indicators <- function(scenario_name, scenario_path, selected_indicators) {
+  
+  file_tbl <- list_target_csvs(scenario_path)
+  
+  df_raw <- lapply(seq_len(nrow(file_tbl)), function(i) {
+    df <- read_indicator_csv(file_tbl$file[i])
+    df$step <- file_tbl$step[i]
+    df
+  }) %>%
+    bind_rows()
+  
+  df_mean <- df_raw %>%
+    select(Column, Row, Lon, Lat, step, all_of(selected_indicators)) %>%
+    group_by(Column, Row, Lon, Lat) %>%
+    summarise(
+      across(all_of(selected_indicators), ~ mean(.x, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    mutate(scenario = scenario_name)
+  
+  df_long <- df_mean %>%
+    pivot_longer(
+      cols = all_of(selected_indicators),
+      names_to = "indicator",
+      values_to = "value"
+    ) %>%
+    mutate(
+      indicator = factor(indicator, levels = selected_indicators)
+    )
+  
+  df_long
+}
+
+all_indicator_results <- list()
+
+for (sc_name in names(scenario_dirs)) {
+  message("Processing scenario: ", sc_name)
+  
+  all_indicator_results[[sc_name]] <- process_scenario_indicators(
+    scenario_name = sc_name,
+    scenario_path = scenario_dirs[[sc_name]],
+    selected_indicators = selected_indicators
+  )
+}
+
+all_indicators_df <- bind_rows(all_indicator_results)
+```
+
+% change vs baseline
+```{r}
+baseline_ref <- all_indicators_df %>%
+  filter(scenario == "Baseline") %>%
+  select(Column, Row, Lon, Lat, indicator, baseline_value = value)
+
+scenario_change_df <- all_indicators_df %>%
+  filter(scenario != "Baseline") %>%
+  left_join(
+    baseline_ref,
+    by = c("Column", "Row", "Lon", "Lat", "indicator")
+  ) %>%
+  mutate(
+    pct_change = case_when(
+      baseline_value == 0 & value == 0 ~ 0,
+      baseline_value == 0 & value != 0 ~ NA_real_,
+      TRUE ~ ((value - baseline_value) / baseline_value) * 100
+    ),
+    scenario = factor(
+      scenario,
+      levels = c("CC", "OWF", "OWF_CC"),
+      labels = c("CC", "OWF", "OWF + CC")
+    )
+  )
+```
+
+plot function
+```{r}
+make_scenario_indicator_subplot <- function(df_panel,
+                                            show_x = FALSE,
+                                            show_y = FALSE) {
+  
+  # ensure full raster grid (this is the fix)
+  df_panel <- df_panel %>%
+    tidyr::complete(
+      Lon = unique(Lon),
+      Lat = unique(Lat)
+    )
+  # panel-specific limits
+  panel_min <- quantile(df_panel$pct_change, probs = 0.01, na.rm = TRUE)
+  panel_max <- quantile(df_panel$pct_change, probs = 0.99, na.rm = TRUE)
+  
+  # safeguards
+  if (!is.finite(panel_min)) panel_min <- min(df_panel$pct_change, na.rm = TRUE)
+  if (!is.finite(panel_max)) panel_max <- max(df_panel$pct_change, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- -1
+  if (!is.finite(panel_max)) panel_max <- 1
+  
+  if (panel_min == panel_max) {
+    panel_min <- panel_min - 1
+    panel_max <- panel_max + 1
+  }
+  
+  p <- ggplot(df_panel, aes(x = Lon, y = Lat, fill = pct_change)) +
+    geom_raster() +
+    geom_polygon(
+      data = land_main_df_plot,
+      aes(x = x, y = y, group = poly_id),
+      inherit.aes = FALSE,
+      fill = "grey85",
+      colour = "grey45",
+      linewidth = 0.2
+      ) +
+    coord_equal(expand = FALSE) +
+    scale_x_continuous(breaks = pretty(range(df_panel$Lon, na.rm = TRUE), n = 3)) +
+    scale_y_continuous(breaks = pretty(range(df_panel$Lat, na.rm = TRUE), n = 3)) +
+    scale_fill_gradient2(
+      low = "#E67E22",
+      mid = "white",
+      high = "#2C7FB8",
+      midpoint = 0,
+      limits = c(panel_min, panel_max),
+      oob = scales::squish,
+      breaks = pretty(c(panel_min, panel_max), n = 3),
+      labels = function(x) paste0(round(x, 1), "%"),
+      na.value = "white",
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(15, "mm"),
+        barwidth  = unit(5, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(
+      fill = NULL,
+      x = if (show_x) "Longitude" else NULL,
+      y = if (show_y) "Latitude" else NULL
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 11),
+      panel.grid = element_blank(),
+      panel.background = element_rect(
+        fill = "white", colour = NA),
+      legend.position = c(0.98, 0.02),
+      legend.justification = c(1, 0),
+      legend.box.background = element_rect(
+        colour = "black",
+        fill = scales::alpha("white", 0.75)
+      ),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0.75),
+        colour = NA
+      ),
+      plot.margin = margin(2, 2, 2, 2)
+    )
+  
+  if (!show_x) {
+    p <- p + theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  }
+  
+  if (!show_y) {
+    p <- p + theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+  }
+  
+  p
+}
+```
+
+Grouped scenario plots
+```{r}
+plot_grouped_scenario_figure <- function(df_change, indicator_groups, group_name,
+                                         out_dir, filename,
+                                         width = 14, height = 16) {
+  
+  inds <- indicator_groups[[group_name]]
+  
+  df_grp <- df_change %>%
+    filter(indicator %in% inds) %>%
+    mutate(indicator = factor(indicator, levels = inds))
+  
+  # -----------------------------
+  # scenario header row
+  # -----------------------------
+  header_row <- wrap_plots(
+    list(
+      ggplot() + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.375, y = 0.2, label = "   CC   ",
+                 fontface = "bold", size = 6) +
+        xlim(0, 1) + ylim(0, 1) + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.375, y = 0.2, label = "   OWF  ",
+                 fontface = "bold", size = 6) +
+        xlim(0, 1) + ylim(0, 1) + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.375, y = 0.2, label = "OWF + CC",
+                 fontface = "bold", size = 6) +
+        xlim(0, 1) + ylim(0, 1) + theme_void()
+    ),
+    ncol = 4
+  ) +
+    plot_layout(widths = c(0.9, 3, 3, 3))
+  
+  # -----------------------------
+  # indicator rows
+  # -----------------------------
+  row_blocks <- lapply(seq_along(inds), function(i) {
+    ind <- inds[i]
+    df_ind <- df_grp %>% filter(indicator == ind)
+    
+    # indicator title
+    row_title <- ggplot() +
+      annotate("text",
+               x = 0.02, y = 0.25,
+               label = ind,
+               hjust = 0,
+               fontface = "bold",
+               size = 4.6) +
+      coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), clip = "off") +
+      theme_void() +
+      theme(
+        plot.margin = margin(0, 0, -8, 0)
+      )
+    
+    scen_levels <- c("CC", "OWF", "OWF + CC")
+    
+    row_maps <- lapply(seq_along(scen_levels), function(j) {
+      sc <- scen_levels[j]
+      df_panel <- df_ind %>% filter(scenario == sc)
+      
+      make_scenario_indicator_subplot(
+        df_panel,
+        show_x = i == length(inds),
+        show_y = j == 1
+      )
+    })
+    
+    maps_row <- wrap_plots(row_maps, ncol = 3)
+    
+    row_title / maps_row + plot_layout(heights = c(0.02, 0.1))
+  })
+  
+  maps_block <- wrap_plots(row_blocks, ncol = 1)
+  
+  final_plot <- header_row / maps_block +
+    plot_layout(heights = c(0.04, 1))
+  
+  print(final_plot)
+  
+  ggsave(
+    filename = file.path(out_dir, filename),
+    plot = final_plot,
+    width = width,
+    height = height,
+    dpi = 800
+  )
+  
+  final_plot
+}
+```
+
+Make all plots
+```{r}
+# Manuscript figures:
+indicator_groups_ms <- list(
+  
+  "Biomass-based" = c(
+    "Total B",
+    "Fish B",
+    "Invertebrates B"
+  ),
+  
+  "Catch-based" = c(
+    "Total C",
+    "Fish C",
+    "Invertebrate C"
+  ),
+  
+  "Trophic level-based" = c(
+    "TL community",
+    "TL community 3,25",
+    "TL catch"
+  )
+)
+
+# Supplementary figues
+indicator_groups_sup <- list(
+  
+  "Biomass-based" = c(
+    "Commercial B",
+    "Demersal B",
+    "Pelagic B"
+  ),
+  
+  "Catch-based" = c(
+    "Demersal C",
+    "Pelagic C"
+  )
+)
+
+
+scenario_ms_plots <- list()
+
+for (grp in names(indicator_groups_ms)) {
+  
+  scenario_ms_plots[[grp]] <- plot_grouped_scenario_figure(
+    df_change = scenario_change_df,
+    indicator_groups = indicator_groups_ms,
+    group_name = grp,
+    out_dir = out_dir,
+    filename = paste0("Scenario_", grp, "_MANUSCRIPT.png"),
+    width = 14,
+    height = 10
+  )
+}
+
+scenario_sup_plots <- list()
+
+for (grp in names(indicator_groups_sup)) {
+  
+  scenario_sup_plots[[grp]] <- plot_grouped_scenario_figure(
+    df_change = scenario_change_df,
+    indicator_groups = indicator_groups_sup,
+    group_name = grp,
+    out_dir = out_dir,
+    filename = paste0("Scenario_", grp, "_SUPPLEMENTARY.png"),
+    width = 14,
+    height = 10
+  )
+}
+# scenario_group_plot_list[["Biomass-based"]] <- plot_grouped_scenario_figure(
+#   df_change = scenario_change_df,
+#   indicator_groups = indicator_groups,
+#   group_name = "Biomass-based",
+#   out_dir = out_dir,
+#   filename = "Scenario_ecological_indicators_Biomass_based.png",
+#   width = 14,
+#   height = 16
+# )
+
+# scenario_group_plot_list[["Catch-based"]] <- plot_grouped_scenario_figure(
+#   df_change = scenario_change_df,
+#   indicator_groups = indicator_groups,
+#   group_name = "Catch-based",
+#   out_dir = out_dir,
+#   filename = "Scenario_ecological_indicators_Catch_based.png",
+#   width = 14,
+#   height = 14
+# )
+
+
+
+scenario_group_plot_list <- list()
+
+scenario_group_plot_list[["Trophic level-based"]] <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  indicator_groups = indicator_groups,
+  group_name = "Trophic level-based",
+  out_dir = out_dir,
+  filename = "Scenario_ecological_indicators_Trophic_level_based.png",
+  width = 14,
+  height = 10
+)
+```
+
+Include zonal summaries
+```{r}
+library(terra)
+owf_rast <- rast("OWF_MPA_2150.asc")
+# owf_rast
+# ext(owf_rast)
+# res(owf_rast)
+# crs(owf_rast)
+
+# Read binary OWF raster
+owf_rast <- rast("OWF_MPA_2150.asc")
+
+# Ensure binary 0/1
+owf_bin <- ifel(owf_rast > 0, 1, 0)
+
+# Build a 3-cell spillover ring using a 7x7 moving window
+# This is a "3-cell neighbourhood" buffer in raster-cell terms
+w <- matrix(1, nrow = 5, ncol = 5)
+
+owf_buffered <- focal(
+  owf_bin,
+  w = w,
+  fun = max,
+  na.policy = "omit"
+)
+
+spillover_bin <- ifel(owf_buffered == 1 & owf_bin == 0, 1, 0)
+outside_bin   <- ifel(owf_buffered == 0, 1, 0)
+
+# Convert to dataframe on the same grid
+owf_df <- as.data.frame(owf_bin, xy = TRUE, na.rm = FALSE)
+names(owf_df) <- c("Lon", "Lat", "in_owf")
+
+spill_df <- as.data.frame(spillover_bin, xy = TRUE, na.rm = FALSE)
+names(spill_df) <- c("Lon", "Lat", "in_spill")
+
+out_df <- as.data.frame(outside_bin, xy = TRUE, na.rm = FALSE)
+names(out_df) <- c("Lon", "Lat", "in_outside")
+
+zone_df <- owf_df %>%
+  left_join(spill_df, by = c("Lon", "Lat")) %>%
+  left_join(out_df,   by = c("Lon", "Lat")) %>%
+  mutate(
+    zone = case_when(
+      in_owf == 1 ~ "OWF",
+      in_spill == 1 ~ "Spillover",
+      in_outside == 1 ~ "Outside OWF",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(Lon, Lat, zone)
+
+# new code using col and row
+nr <- nrow(owf_bin)
+nc <- ncol(owf_bin)
+
+owf_vals   <- as.vector(values(owf_bin, mat = FALSE))
+spill_vals <- as.vector(values(spillover_bin, mat = FALSE))
+out_vals   <- as.vector(values(outside_bin, mat = FALSE))
+
+zone_df_rc <- expand.grid(
+  Column = 1:nc,
+  Row = 1:nr
+) %>%
+  as_tibble() %>%
+  mutate(
+    in_owf = owf_vals,
+    in_spill = spill_vals,
+    in_outside = out_vals,
+    zone = case_when(
+      in_owf == 1 ~ "OWF",
+      in_spill == 1 ~ "Spillover",
+      in_outside == 1 ~ "Outside OWF",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(Column, Row, zone)
+```
+
+Assign zones to data
+```{r}
+zone_df_join <- zone_df %>%
+  mutate(
+    Lon = round(Lon, 6),
+    Lat = round(Lat, 6)
+  )
+
+scenario_change_zones <- scenario_change_df %>%
+  mutate(
+    Lon = round(Lon, 6),
+    Lat = round(Lat, 6)
+  ) %>%
+  left_join(zone_df_join, by = c("Lon", "Lat"))
+
+scenario_change_zones <- scenario_change_df %>%
+  left_join(zone_df_rc, by = c("Column", "Row"))
+```
+
+
+Calculate zonal summaries
+```{r}
+# Overall summaries for all scenarios
+zone_summary_overall <- scenario_change_zones %>%
+  group_by(indicator, scenario) %>%
+  summarise(
+    mean_pct_change = mean(pct_change, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(zone = "Overall")
+
+# Zonal summaries only for OWF-based scenarios
+zone_summary_zones <- scenario_change_zones %>%
+  filter(
+    scenario %in% c("OWF", "OWF + CC"),
+    !is.na(zone)
+  ) %>%
+  group_by(indicator, scenario, zone) %>%
+  summarise(
+    mean_pct_change = mean(pct_change, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+zone_summary <- bind_rows(zone_summary_overall, zone_summary_zones) %>%
+  mutate(
+    zone = factor(zone, levels = c("OWF", "Spillover", "Outside OWF", "Overall"))
+  )
+
+
+# NEW SUMMARY
+zone_summary_overall <- scenario_change_zones %>%
+  group_by(indicator, scenario) %>%
+  summarise(
+    mean_pct_change = mean(pct_change, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(zone = "Overall")
+
+zone_summary_zones <- scenario_change_zones %>%
+  filter(
+    scenario %in% c("OWF", "OWF + CC"),
+    !is.na(zone)
+  ) %>%
+  group_by(indicator, scenario, zone) %>%
+  summarise(
+    mean_pct_change = mean(pct_change, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+zone_summary <- bind_rows(zone_summary_overall, zone_summary_zones) %>%
+  mutate(
+    zone = factor(zone, levels = c("OWF", "Spillover", "Outside OWF", "Overall"))
+  )
+```
+
+Plot for visual check
+```{r}
+# coordinates from the raster
+xy_df <- as.data.frame(owf_bin, xy = TRUE, na.rm = FALSE) %>%
+  select(x, y) %>%
+  rename(Lon = x, Lat = y)
+
+zone_plot_df <- bind_cols(
+  zone_df_rc,
+  xy_df
+) %>%
+  mutate(
+    zone = factor(zone, levels = c("OWF", "Spillover", "Outside OWF"))
+  )
+
+zone_check_plot <- ggplot(zone_plot_df, aes(x = Lon, y = Lat, fill = zone)) +
+  geom_raster() +
+  coord_equal() +
+  scale_x_continuous(breaks = pretty(range(zone_plot_df$Lon, na.rm = TRUE), n = 3)) +
+  scale_y_continuous(breaks = pretty(range(zone_plot_df$Lat, na.rm = TRUE), n = 3)) +
+  scale_fill_manual(
+    values = c(
+      "OWF" = "#1f78b4",
+      "Spillover" = "#33a02c",
+      "Outside OWF" = "grey85"
+    ),
+    na.value = "white"
+  ) +
+  labs(
+    title = "OWF zones",
+    x = "Longitude",
+    y = "Latitude",
+    fill = "Zone"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+print(zone_check_plot)
+
+ggsave(
+  file.path(out_dir, "OWF_zone_check_map.png"),
+  zone_check_plot,
+  width = 8,
+  height = 5,
+  dpi = 800
+)
+```
+Barplots
+```{r}
+make_zone_barplot <- function(df_zone_panel) {
+  
+  if (nrow(df_zone_panel) == 0) {
+    return(
+      ggplot() +
+        theme_void()
+    )
+  }
+  
+df_zone_panel <- df_zone_panel %>%
+  mutate(
+    zone_label = case_when(
+      zone == "OWF" ~ "OWF",
+      zone == "Spillover" ~ "SPILL",
+      zone == "Outside OWF" ~ "OUT",
+      zone == "Overall" ~ "ALL",
+      TRUE ~ as.character(zone)
+    ),
+    zone_label = factor(zone_label, levels = c("ALL","OUT","OWF","SPILL")),
+    change_dir = ifelse(mean_pct_change < 0, "decrease", "increase")
+  )
+  
+ggplot(df_zone_panel, aes(x = zone_label, y = mean_pct_change, fill = change_dir)) +
+  geom_col(width = 0.4) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  scale_x_discrete(
+  limits = c("ALL","OUT","OWF","SPILL"),
+  labels = function(x){
+    if(length(unique(df_zone_panel$zone_label)) == 1){
+      ifelse(x == "ALL","ALL","")
+    } else {
+      x
+    }
+  }
+) +
+  scale_fill_manual(
+    values = c(
+      "decrease" = "#E67E22",
+      "increase" = "#2C7FB8"
+    ),
+    guide = "none"
+  ) +
+    labs(x = NULL, y = NULL) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.title = element_blank(),
+      axis.text.x = element_text(size = 12, angle = 0, hjust = 0.5),
+      axis.text.y = element_text(size = 12),
+      axis.ticks.x = element_blank(),
+      panel.grid = element_blank(),
+      plot.margin = margin(-12, 2, 0, 2)
+    )
+}
+```
+
+```{r}
+make_scenario_indicator_panel <- function(df_panel,
+                                          df_zone_panel,
+                                          show_x = FALSE,
+                                          show_y = FALSE) {
+  
+  # ensure full raster grid (this is the fix)
+  df_panel <- df_panel %>%
+    tidyr::complete(
+      Lon = unique(Lon),
+      Lat = unique(Lat)
+    )
+  # robust panel-specific limits
+  panel_min <- quantile(df_panel$pct_change, probs = 0.01, na.rm = TRUE)
+  panel_max <- quantile(df_panel$pct_change, probs = 0.99, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- min(df_panel$pct_change, na.rm = TRUE)
+  if (!is.finite(panel_max)) panel_max <- max(df_panel$pct_change, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- -1
+  if (!is.finite(panel_max)) panel_max <- 1
+  
+  if (panel_min == panel_max) {
+    panel_min <- panel_min - 1
+    panel_max <- panel_max + 1
+  }
+  
+  map_plot <- ggplot(df_panel, aes(x = Lon, y = Lat, fill = pct_change)) +
+    geom_raster() +
+    geom_polygon(
+      data = land_main_df_plot,
+      aes(x = x, y = y, group = poly_id),
+      inherit.aes = FALSE,
+      fill = "grey85",
+      colour = "grey45",
+      linewidth = 0.2
+      ) +
+    coord_equal(expand = FALSE) +
+    scale_x_continuous(breaks = pretty(range(df_panel$Lon, na.rm = TRUE), n = 3)) +
+    scale_y_continuous(breaks = pretty(range(df_panel$Lat, na.rm = TRUE), n = 3)) +
+    scale_fill_gradient2(
+      low = "#E67E22",
+      mid = "white",
+      high = "#2C7FB8",
+      midpoint = 0,
+      limits = c(panel_min, panel_max),
+      oob = scales::squish,
+      breaks = pretty(c(panel_min, panel_max), n = 3),
+      labels = function(x) paste0(round(x, 1), "%"),
+      na.value = "white",
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(13, "mm"),
+        barwidth  = unit(4.5, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(
+      fill = NULL,
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 11),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      legend.position = c(0.98, 0.02),
+      legend.justification = c(1, 0),
+      legend.box.background = element_rect(
+        colour = "black",
+        fill = scales::alpha("white", 0.75)
+      ),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0.75),
+        colour = NA
+      ),
+      plot.margin = margin(2, 2, -6, 2)
+    )
+  
+  # Keep axis space equal across panels; hide unused elements with transparency
+  if (!show_x) {
+    map_plot <- map_plot + theme(
+      axis.title.x = element_text(colour = NA),
+      axis.text.x  = element_text(colour = NA),
+      axis.ticks.x = element_line(colour = NA)
+    )
+  }
+  
+  if (!show_y) {
+    map_plot <- map_plot + theme(
+      axis.title.y = element_text(colour = NA),
+      axis.text.y  = element_text(colour = NA),
+      axis.ticks.y = element_line(colour = NA)
+    )
+  }
+  
+  bar_plot <- make_zone_barplot(df_zone_panel)
+  
+  map_plot / bar_plot + plot_layout(heights = c(1, 0.6))
+}
+```
+
+```{r}
+plot_grouped_scenario_figure <- function(df_change, indicator_groups, group_name,
+                                         out_dir, filename,
+                                         width = 14, height = 16) {
+  
+  inds <- indicator_groups[[group_name]]
+  
+  df_grp <- df_change %>%
+    filter(indicator %in% inds) %>%
+    mutate(indicator = factor(indicator, levels = inds))
+  
+  # -----------------------------
+  # scenario header row
+  # -----------------------------
+  header_row <- wrap_plots(
+    list(
+      ggplot() + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.375, y = 0.2, label = "   CC   ",
+                 fontface = "bold", size = 6) +
+        xlim(0, 1) + ylim(0, 1) + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.375, y = 0.2, label = "   OWF  ",
+                 fontface = "bold", size = 6) +
+        xlim(0, 1) + ylim(0, 1) + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.375, y = 0.2, label = "OWF + CC",
+                 fontface = "bold", size = 6) +
+        xlim(0, 1) + ylim(0, 1) + theme_void()
+    ),
+    ncol = 4
+  ) +
+    plot_layout(widths = c(0.9, 3, 3, 3))
+  
+  # -----------------------------
+  # indicator rows
+  # -----------------------------
+  row_blocks <- lapply(seq_along(inds), function(i) {
+    ind <- inds[i]
+    df_ind <- df_grp %>% filter(indicator == ind)
+    
+    # indicator title
+    row_title <- ggplot() +
+      annotate("text",
+               x = 0.02, y = 0.25,
+               label = ind,
+               hjust = 0,
+               fontface = "bold",
+               size = 4.6) +
+      coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), clip = "off") +
+      theme_void() +
+      theme(
+        plot.margin = margin(0, 0, -8, 0)
+      )
+    
+    scen_levels <- c("CC", "OWF", "OWF + CC")
+    
+    row_maps <- lapply(seq_along(scen_levels), function(j) {
+      sc <- scen_levels[j]
+      
+      df_panel <- df_ind %>% filter(scenario == sc)
+      
+      df_zone_panel <- zone_summary %>%
+        filter(
+          indicator == ind,
+          scenario == sc
+          )
+      make_scenario_indicator_panel(
+        df_panel = df_panel,
+        df_zone_panel = df_zone_panel,
+        show_x = i == length(inds),
+        show_y = j == 1
+        )
+      })
+    
+    maps_row <- wrap_plots(row_maps, ncol = 3)
+    
+    row_title / maps_row + plot_layout(heights = c(0.02, 0.1))
+  })
+  
+  maps_block <- wrap_plots(row_blocks, ncol = 1)
+  
+  final_plot <- header_row / maps_block +
+    plot_layout(heights = c(0.04, 1))
+  
+  print(final_plot)
+  
+  ggsave(
+    filename = file.path(out_dir, filename),
+    plot = final_plot,
+    width = width,
+    height = height,
+    dpi = 800
+  )
+  
+  final_plot
+}
+```
+
+test plot
+```{r}
+test_ind <- "Total B"
+test_sc  <- "CC"
+
+df_panel_test <- scenario_change_df %>%
+  filter(indicator == test_ind, scenario == test_sc)
+
+df_zone_test <- zone_summary %>%
+  filter(indicator == test_ind, scenario == test_sc)
+
+test_plot <- make_scenario_indicator_panel(
+  df_panel = df_panel_test,
+  df_zone_panel = df_zone_test,
+  show_x = TRUE,
+  show_y = TRUE
+)
+
+print(test_plot)
+```
+Plot for indicators
+
+```{r}
+scenario_group_plot_list <- list()
+
+scenario_group_plot_list[["Biomass-based"]] <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  indicator_groups = indicator_groups,
+  group_name = "Biomass-based",
+  out_dir = out_dir,
+  filename = "Scenario_ecological_indicators_Biomass_based.png",
+  width = 14,
+  height = 16
+)
+
+scenario_group_plot_list[["Catch-based"]] <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  indicator_groups = indicator_groups,
+  group_name = "Catch-based",
+  out_dir = out_dir,
+  filename = "Scenario_ecological_indicators_Catch_based.png",
+  width = 14,
+  height = 14
+)
+
+scenario_group_plot_list[["Trophic level-based"]] <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  indicator_groups = indicator_groups,
+  group_name = "Trophic level-based",
+  out_dir = out_dir,
+  filename = "Scenario_ecological_indicators_Trophic_level_based.png",
+  width = 14,
+  height = 10
+)
+```
+
+```{r}
+############################################################
+# MANUSCRIPT FIGURES
+############################################################
+
+scenario_ms_plot_list <- list()
+
+scenario_ms_plot_list[["Biomass-based"]] <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  indicator_groups = indicator_groups_ms,
+  group_name = "Biomass-based",
+  out_dir = out_dir,
+  filename = "Scenario_ecological_indicators_Biomass_based_MANUSCRIPT.png",
+  width = 14,
+  height = 14.5
+)
+
+scenario_ms_plot_list[["Catch-based"]] <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  indicator_groups = indicator_groups_ms,
+  group_name = "Catch-based",
+  out_dir = out_dir,
+  filename = "Scenario_ecological_indicators_Catch_based_MANUSCRIPT.png",
+  width = 14,
+  height = 14.5
+)
+
+scenario_ms_plot_list[["Trophic level-based"]] <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  indicator_groups = indicator_groups_ms,
+  group_name = "Trophic level-based",
+  out_dir = out_dir,
+  filename = "Scenario_ecological_indicators_Trophic_level_based_MANUSCRIPT.png",
+  width = 14,
+  height = 14.5
+)
+
+############################################################
+# SUPPLEMENTARY FIGURES
+############################################################
+
+scenario_sup_plot_list <- list()
+
+scenario_sup_plot_list[["Biomass-based"]] <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  indicator_groups = indicator_groups_sup,
+  group_name = "Biomass-based",
+  out_dir = out_dir,
+  filename = "Scenario_ecological_indicators_Biomass_based_SUPPLEMENTARY.png",
+  width = 14,
+  height = 14.5
+)
+
+scenario_sup_plot_list[["Catch-based"]] <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  indicator_groups = indicator_groups_sup,
+  group_name = "Catch-based",
+  out_dir = out_dir,
+  filename = "Scenario_ecological_indicators_Catch_based_SUPPLEMENTARY.png",
+  width = 14,
+  height = 14.5
+)
+```
+Table of absolute and relative changes according to zones (see also code zonal summaries above)
+```{r}
+# =========================================================
+# SUMMARY TABLE: zonal absolute values + % change vs zonal baseline
+# =========================================================
+
+library(dplyr)
+library(tidyr)
+library(readr)
+
+# ---------------------------------------------------------
+# 1. Attach zones to ALL scenarios, including Baseline
+# ---------------------------------------------------------
+all_indicators_zones <- all_indicators_df %>%
+  left_join(zone_df_rc, by = c("Column", "Row")) %>%
+  mutate(
+    zone = case_when(
+      zone == "OWF" ~ "OWF",
+      zone == "Spillover" ~ "SPILL",
+      zone == "Outside OWF" ~ "OUT",
+      TRUE ~ NA_character_
+    )
+  )
+
+# ---------------------------------------------------------
+# 2. Build a table with both:
+#    - ALL = whole study area
+#    - OWF / SPILL / OUT = zonal subsets
+# ---------------------------------------------------------
+
+# Whole study area
+summary_all <- all_indicators_zones %>%
+  group_by(indicator, scenario) %>%
+  summarise(
+    abs_value = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(zone = "ALL")
+
+# Zonal subsets
+summary_zones <- all_indicators_zones %>%
+  filter(!is.na(zone)) %>%
+  group_by(indicator, scenario, zone) %>%
+  summarise(
+    abs_value = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summary_abs <- bind_rows(summary_all, summary_zones)
+
+# ---------------------------------------------------------
+# 3. Extract baseline zonal means
+# ---------------------------------------------------------
+baseline_zone_ref <- summary_abs %>%
+  filter(scenario == "Baseline") %>%
+  select(
+    indicator,
+    zone,
+    baseline_abs_value = abs_value
+  )
+
+# ---------------------------------------------------------
+# 4. Calculate % change relative to the baseline of the SAME zone
+# ---------------------------------------------------------
+summary_vs_baseline <- summary_abs %>%
+  filter(scenario != "Baseline") %>%
+  left_join(baseline_zone_ref, by = c("indicator", "zone")) %>%
+  mutate(
+    pct_change = case_when(
+      baseline_abs_value == 0 & abs_value == 0 ~ 0,
+      baseline_abs_value == 0 & abs_value != 0 ~ NA_real_,
+      TRUE ~ ((abs_value - baseline_abs_value) / baseline_abs_value) * 100
+    )
+  )
+
+# ---------------------------------------------------------
+# 5. Optional: keep a logical indicator order
+# ---------------------------------------------------------
+summary_vs_baseline <- summary_vs_baseline %>%
+  mutate(
+    indicator = factor(indicator, levels = selected_indicators),
+    scenario = factor(scenario, levels = c("CC", "OWF", "OWF_CC")),
+    zone = factor(zone, levels = c("ALL", "OWF", "SPILL", "OUT"))
+  ) %>%
+  arrange(indicator, scenario, zone)
+
+# ---------------------------------------------------------
+# 6. Formatting function for table cells
+#    Example: 12.34 (+5.6%)
+# ---------------------------------------------------------
+format_summary_cell <- function(abs_value, pct_change,
+                                abs_digits = 2,
+                                pct_digits = 1) {
+  
+  abs_txt <- formatC(abs_value, format = "f", digits = abs_digits)
+  
+  pct_txt <- ifelse(
+    is.na(pct_change),
+    "NA",
+    paste0(
+      ifelse(pct_change > 0, "+", ""),
+      formatC(pct_change, format = "f", digits = pct_digits),
+      "%"
+    )
+  )
+  
+  paste0(abs_txt, " (", pct_txt, ")")
+}
+
+summary_vs_baseline_fmt <- summary_vs_baseline %>%
+  mutate(
+    cell = format_summary_cell(abs_value, pct_change)
+  )
+
+# ---------------------------------------------------------
+# 7. Wide table:
+#    rows = indicators
+#    columns = scenario x zone
+# ---------------------------------------------------------
+summary_table_wide <- summary_vs_baseline_fmt %>%
+  mutate(
+    scenario = recode(
+      scenario,
+      "OWF_CC" = "OWF + CC"
+    )
+  ) %>%
+  unite(col_name, scenario, zone, sep = "_") %>%
+  select(indicator, col_name, cell) %>%
+  pivot_wider(
+    names_from = col_name,
+    values_from = cell
+  ) %>%
+  select(
+    indicator,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  ) %>%
+  mutate(
+    indicator = as.character(indicator)
+  )
+
+summary_table_wide
+
+```
+
+Table showing absolute change and relative change.
+```{r}
+# =========================================================
+# PREP: add absolute change
+# =========================================================
+
+summary_vs_baseline <- summary_vs_baseline %>%
+  mutate(
+    abs_change = abs_value - baseline_abs_value
+  )
+```
+
+```{r}
+# =========================================================
+# TABLE: only relative changes (%)
+# =========================================================
+
+format_pct_cell <- function(x, digits = 1) {
+  ifelse(
+    is.na(x),
+    "NA",
+    paste0(
+      ifelse(x > 0, "+", ""),
+      formatC(x, format = "f", digits = digits),
+      "%"
+    )
+  )
+}
+
+summary_table_pct <- summary_vs_baseline %>%
+  mutate(
+    scenario = recode(scenario, "OWF_CC" = "OWF + CC"),
+    pct_cell = format_pct_cell(pct_change)
+  ) %>%
+  unite(col_name, scenario, zone, sep = "_") %>%
+  select(indicator, col_name, pct_cell) %>%
+  pivot_wider(names_from = col_name, values_from = pct_cell) %>%
+  select(
+    indicator,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  ) %>%
+  mutate(indicator = as.character(indicator))
+
+summary_table_pct
+```
+
+```{r}
+# =========================================================
+# TABLE: only absolute changes (+/- X)
+# =========================================================
+
+format_abs_change_cell <- function(x, digits = 2) {
+  ifelse(
+    is.na(x),
+    "NA",
+    paste0(
+      ifelse(x > 0, "+", ""),
+      formatC(x, format = "f", digits = digits)
+    )
+  )
+}
+
+summary_table_abs_change <- summary_vs_baseline %>%
+  mutate(
+    scenario = recode(scenario, "OWF_CC" = "OWF + CC"),
+    abs_change_cell = format_abs_change_cell(abs_change)
+  ) %>%
+  unite(col_name, scenario, zone, sep = "_") %>%
+  select(indicator, col_name, abs_change_cell) %>%
+  pivot_wider(names_from = col_name, values_from = abs_change_cell) %>%
+  select(
+    indicator,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  ) %>%
+  mutate(indicator = as.character(indicator))
+
+summary_table_abs_change
+```
+
+```{r}
+# =========================================================
+# TABLE: absolute change + relative change
+# =========================================================
+
+format_abs_and_pct_cell <- function(abs_change, pct_change,
+                                    abs_digits = 2,
+                                    pct_digits = 1) {
+  
+  abs_txt <- ifelse(
+    is.na(abs_change),
+    "NA",
+    paste0(
+      ifelse(abs_change > 0, "+", ""),
+      formatC(abs_change, format = "f", digits = abs_digits)
+    )
+  )
+  
+  pct_txt <- ifelse(
+    is.na(pct_change),
+    "NA",
+    paste0(
+      ifelse(pct_change > 0, "+", ""),
+      formatC(pct_change, format = "f", digits = pct_digits),
+      "%"
+    )
+  )
+  
+  paste0(abs_txt, " (", pct_txt, ")")
+}
+
+summary_table_abs_and_pct <- summary_vs_baseline %>%
+  mutate(
+    scenario = recode(scenario, "OWF_CC" = "OWF + CC"),
+    cell = format_abs_and_pct_cell(abs_change, pct_change)
+  ) %>%
+  unite(col_name, scenario, zone, sep = "_") %>%
+  select(indicator, col_name, cell) %>%
+  pivot_wider(names_from = col_name, values_from = cell) %>%
+  select(
+    indicator,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  ) %>%
+  mutate(indicator = as.character(indicator))
+
+summary_table_abs_and_pct
+```
+
+Save tables
+```{r}
+# =========================================================
+# EXPORT TABLES
+# =========================================================
+
+write_csv(summary_table_pct,
+          file.path("Ecological_indicator_summary_table_pct_only.csv"))
+
+write_csv(summary_table_abs_change,
+          file.path("Ecological_indicator_summary_table_abs_change_only.csv"))
+
+write_csv(summary_table_abs_and_pct,
+          file.path("Ecological_indicator_summary_table_abs_and_pct.csv"))
+```
+
+
+Combining with ENA table
+```{r}
+# =========================================================
+# COMBINE ECOLOGICAL + ENA TABLES
+# Two sub-rows per indicator: absolute change and % change
+# =========================================================
+
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+
+# ---------------------------------------------------------
+# 1. Read ENA numeric table
+# ---------------------------------------------------------
+ena_numeric <- read_csv("ENA_summary_table_numeric.csv")
+```
+
+
+```{r}
+# ---------------------------------------------------------
+# 2. Reshape ENA numeric table correctly
+#    The file is effectively one row per indicator × source-zone,
+#    with sparse values spread across wide columns.
+#    We pivot longer and keep only non-NA values.
+# ---------------------------------------------------------
+ena_from_numeric <- ena_numeric %>%
+  pivot_longer(
+    cols = -c(indicator, baseline_abs_value),
+    names_to = c("scenario", "zone", ".value"),
+    names_pattern = "^(CC|OWF|OWF \\+ CC)_(ALL|OWF|SPILL|OUT)_(abs_value|abs_change|pct_change)$"
+  ) %>%
+  filter(
+    !is.na(abs_value) | !is.na(abs_change) | !is.na(pct_change)
+  ) %>%
+  group_by(indicator, scenario, zone) %>%
+  summarise(
+    baseline_abs_value = first(na.omit(baseline_abs_value)),
+    abs_value = first(na.omit(abs_value)),
+    abs_change = first(na.omit(abs_change)),
+    pct_change = first(na.omit(pct_change)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    indicator_group = "ENA"
+  )
+
+ena_from_numeric
+
+# ---------------------------------------------------------
+# 3. Prepare ecological indicators
+#    Uses the object already present in your ecological script
+# ---------------------------------------------------------
+eco_master <- summary_vs_baseline %>%
+  mutate(
+    scenario = recode(scenario, "OWF_CC" = "OWF + CC"),
+    indicator_group = case_when(
+      indicator %in% c("Total B", "Fish B", "Invertebrates B",
+                       "Commercial B", "Demersal B", "Pelagic B") ~ "Biomass",
+      indicator %in% c("Total C", "Fish C", "Invertebrates C",
+                       "Commercial C", "Demersal C", "Pelagic C") ~ "Catch",
+      indicator %in% c("TL community", "TL catch", "TL2") ~ "Trophic level",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  select(indicator_group, indicator, scenario, zone, abs_change, pct_change)
+
+# ---------------------------------------------------------
+# 4. Prepare ENA indicators
+# ---------------------------------------------------------
+ena_master <- ena_from_numeric %>%
+  select(indicator_group, indicator, scenario, zone, abs_change, pct_change)
+
+# ---------------------------------------------------------
+# 5. Combine both
+# ---------------------------------------------------------
+combined_master <- bind_rows(eco_master, ena_master) %>%
+  mutate(
+    scenario = factor(scenario, levels = c("CC", "OWF", "OWF + CC")),
+    zone = factor(zone, levels = c("ALL", "OWF", "SPILL", "OUT"))
+  )
+```
+
+
+```{r}
+# ---------------------------------------------------------
+# 6. Formatting helpers
+# ---------------------------------------------------------
+format_abs_change <- function(x, digits = 2) {
+  ifelse(
+    is.na(x),
+    "NA",
+    paste0(
+      ifelse(x > 0, "+", ""),
+      formatC(x, format = "f", digits = digits)
+    )
+  )
+}
+
+format_pct_change <- function(x, digits = 1) {
+  ifelse(
+    is.na(x),
+    "NA",
+    paste0(
+      ifelse(x > 0, "+", ""),
+      formatC(x, format = "f", digits = digits),
+      "%"
+    )
+  )
+}
+```
+
+
+```{r}
+# ---------------------------------------------------------
+# 7. Build two-subrow table
+# ---------------------------------------------------------
+combined_long <- bind_rows(
+  combined_master %>%
+    mutate(
+      change_type = "Δ",
+      value_fmt = format_abs_change(abs_change, digits = 2)
+    ),
+  combined_master %>%
+    mutate(
+      change_type = "%",
+      value_fmt = format_pct_change(pct_change, digits = 1)
+    )
+) %>%
+  arrange(indicator_group, indicator, scenario, zone, change_type)
+
+combined_table_two_rows <- combined_long %>%
+  unite(col_name, scenario, zone, sep = "_") %>%
+  select(indicator_group, indicator, change_type, col_name, value_fmt) %>%
+  pivot_wider(
+    names_from = col_name,
+    values_from = value_fmt
+  ) %>%
+  select(
+    indicator_group, indicator, change_type,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  )
+
+combined_table_two_rows
+```
+
+```{r}
+combined_table_two_rows_pretty <- combined_table_two_rows %>%
+  group_by(indicator_group, indicator) %>%
+  mutate(
+    indicator_display = ifelse(row_number() == 1, as.character(indicator), "")
+  ) %>%
+  ungroup() %>%
+  select(
+    indicator_group,
+    indicator_display,
+    change_type,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  ) %>%
+  rename(indicator = indicator_display)
+
+combined_table_two_rows_pretty
+
+write_csv(
+  combined_table_two_rows_pretty,
+  file.path("Combined_summary_table_two_rows_pretty.csv")
+)
+```
+
+Now make a figure of this table
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(scales)
+
+# ---------------------------------------------------------
+# Prepare plotting data
+# ---------------------------------------------------------
+plot_df <- bind_rows(
+  combined_master %>%
+    mutate(
+      change_type = "%",
+      value_num = pct_change,
+      label = ifelse(
+        is.na(pct_change),
+        "NA",
+        paste0(
+          ifelse(pct_change > 0, "+", ""),
+          formatC(pct_change, format = "f", digits = 1),
+          "%"
+        )
+      )
+    ),
+  combined_master %>%
+    mutate(
+      change_type = "Δ",
+      value_num = abs_change,
+      label = ifelse(
+        is.na(abs_change),
+        "NA",
+        paste0(
+          ifelse(abs_change > 0, "+", ""),
+          formatC(abs_change, format = "f", digits = 2)
+        )
+      )
+    )
+) %>%
+  mutate(
+    scenario = factor(scenario, levels = c("CC", "OWF", "OWF + CC")),
+    zone = factor(zone, levels = c("ALL", "OWF", "SPILL", "OUT")),
+    col_id = paste(scenario, zone, sep = "_")
+  )
+```
+
+```{r}
+# ---------------------------------------------------------
+# Row ordering
+# ---------------------------------------------------------
+indicator_order <- c(
+  "Total B", "Fish B", "Invertebrates B", "Demersal B", "Pelagic B", "Commercial B",
+  "Total C", "Fish C", "Invertebrate C", "Demersal C", "Pelagic C",
+  "TL community", "TL community 3,25", "TL catch",
+  "FCI", "H", "RDC", "SOI"
+)
+
+plot_df <- plot_df %>%
+  mutate(
+    indicator = factor(indicator, levels = indicator_order),
+    change_type = factor(change_type, levels = c("%", "Δ"))
+  ) %>%
+  arrange(indicator, change_type) %>%
+  mutate(
+    row_id = paste(indicator, change_type, sep = " | ")
+  )
+
+row_levels <- plot_df %>%
+  distinct(indicator, change_type, row_id) %>%
+  arrange(indicator, change_type) %>%
+  pull(row_id)
+
+plot_df <- plot_df %>%
+  mutate(
+    row_id = factor(row_id, levels = rev(row_levels))
+  )
+# Fill only the % rows
+plot_df <- plot_df %>%
+  mutate(
+    fill_value = ifelse(change_type == "%", value_num, NA_real_)
+  )
+```
+
+fill color cap
+```{r}
+fill_limit <- max(abs(plot_df$fill_value), na.rm = TRUE)
+
+# OR
+
+fill_limit <- 25
+
+plot_df <- plot_df %>%
+  mutate(
+    fill_value_capped = pmax(pmin(fill_value, fill_limit), -fill_limit)
+  )
+```
+
+```{r}
+p_table_heatmap <- ggplot(plot_df, aes(x = col_id, y = row_id)) +
+  geom_tile(aes(fill = fill_value_capped), color = "grey70", linewidth = 0.3) +
+  geom_text(aes(label = label), size = 3) +
+  scale_fill_gradient2(
+    low = "#E67E22",
+    mid = "white",
+    high = "#2C7FB8",
+    midpoint = 0,
+    limits = c(-fill_limit, fill_limit),
+    oob = squish,
+    na.value = "grey95",
+    name = "% change"
+  ) +
+  scale_x_discrete(
+    labels = c(
+      "CC_ALL" = "ALL", "CC_OWF" = "OWF", "CC_SPILL" = "SPILL", "CC_OUT" = "OUT",
+      "OWF_ALL" = "ALL", "OWF_OWF" = "OWF", "OWF_SPILL" = "SPILL", "OWF_OUT" = "OUT",
+      "OWF + CC_ALL" = "ALL", "OWF + CC_OWF" = "OWF", "OWF + CC_SPILL" = "SPILL", "OWF + CC_OUT" = "OUT"
+    )
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 10, face = "bold"),
+    axis.text.y = element_text(size = 10),
+    legend.position = "right"
+  )
+
+p_table_heatmap
+p_table_heatmap +
+  annotate("text", x = 2.5, y = length(row_levels) + 1.2, label = "Climate change", fontface = "bold", size = 4) +
+  annotate("text", x = 6.5, y = length(row_levels) + 1.2, label = "Offshore wind farms", fontface = "bold", size = 4) +
+  annotate("text", x = 10.5, y = length(row_levels) + 1.2, label = "Offshore wind farms + climate change", fontface = "bold", size = 4) +
+  geom_vline(xintercept = c(4.5, 8.5), linewidth = 0.7) + coord_cartesian(clip = "off") +
+  theme(plot.margin = margin(20, 20, 20, 20))
+```
+Plot only % change
+```{r}
+# =========================================================
+# HEATMAP FIGURE: percentage change only
+# Rows = indicators
+# Columns = scenario x zone
+# =========================================================
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# ---------------------------------------------------------
+# 1. Prepare plotting dataframe
+# ---------------------------------------------------------
+plot_pct <- combined_master %>%
+  mutate(
+    scenario = factor(scenario, levels = c("CC", "OWF", "OWF + CC")),
+    zone = factor(zone, levels = c("ALL", "OWF", "SPILL", "OUT")),
+    col_id = factor(
+      paste(scenario, zone, sep = "_"),
+      levels = c(
+        "CC_ALL", "CC_OWF", "CC_SPILL", "CC_OUT",
+        "OWF_ALL", "OWF_OWF", "OWF_SPILL", "OWF_OUT",
+        "OWF + CC_ALL", "OWF + CC_OWF", "OWF + CC_SPILL", "OWF + CC_OUT"
+      )
+    ),
+    label = ifelse(
+      is.na(pct_change),
+      "NA",
+      paste0(
+        ifelse(pct_change > 0, "+", ""),
+        formatC(pct_change, format = "f", digits = 1),
+        "%"
+      )
+    )
+  )
+
+# ---------------------------------------------------------
+# 2. Set indicator order
+# Adjust if your exact names differ slightly
+# ---------------------------------------------------------
+indicator_order <- c(
+  "Total B", "Fish B", "Invertebrates B", "Demersal B", "Pelagic B", "Commercial B",
+  "Total C", "Fish C", "Invertebrate C", "Demersal C", "Pelagic C",
+  "TL community", "TL community 3,25", "TL catch",
+  "FCI", "H", "RDC", "SOI"
+)
+
+plot_pct <- plot_pct %>%
+  mutate(
+    indicator = factor(indicator, levels = indicator_order)
+  ) %>%
+  arrange(indicator) %>%
+  mutate(
+    row_id = factor(as.character(indicator), levels = rev(indicator_order))
+  )
+
+# ---------------------------------------------------------
+# 3. Add indicator groups for separators / optional styling
+# ---------------------------------------------------------
+plot_pct <- plot_pct %>%
+  mutate(
+    indicator_group = case_when(
+      indicator %in% c("Total B", "Fish B", "Invertebrates B", "Demersal B", "Pelagic B", "Commercial B") ~ "Biomass",
+      indicator %in% c("Total C", "Fish C", "Invertebrate C", "Demersal C", "Pelagic C") ~ "Catch",
+      indicator %in% c("TL community", "TL community 3,25", "TL catch") ~ "Trophic level",
+      indicator %in% c("FCI", "H", "RDC", "SOI") ~ "ENA",
+      TRUE ~ "Other"
+    )
+  )
+
+# ---------------------------------------------------------
+# 4. Determine asymmetric color caps
+# lower cap = strongest decrease excluding -100
+# upper cap = strongest increase
+# ---------------------------------------------------------
+neg_cap <- plot_pct %>%
+  filter(!is.na(pct_change), pct_change != -100) %>%
+  summarise(cap = min(pct_change)) %>%
+  pull(cap)
+
+pos_cap <- plot_pct %>%
+  filter(!is.na(pct_change)) %>%
+  summarise(cap = max(pct_change)) %>%
+  pull(cap)
+
+# safety fallback
+if (!is.finite(neg_cap)) neg_cap <- -1
+if (!is.finite(pos_cap)) pos_cap <- 1
+
+# cap values for plotting
+plot_pct <- plot_pct %>%
+  mutate(
+    fill_value = case_when(
+      is.na(pct_change) ~ NA_real_,
+      pct_change < neg_cap ~ neg_cap,
+      pct_change > pos_cap ~ pos_cap,
+      TRUE ~ pct_change
+    ),
+    fontface_lab = ifelse(!is.na(pct_change) & pct_change == -100, "bold", "plain")
+  )
+
+# ---------------------------------------------------------
+# 5. Separator positions
+# ---------------------------------------------------------
+# horizontal separators between groups
+hline_df <- data.frame(
+  y = c(12.5, 7.5, 4.5)   # after Biomass, Catch, Trophic level
+)
+
+# ---------------------------------------------------------
+# 6. Plot
+# ---------------------------------------------------------
+p_pct_heatmap <- ggplot(plot_pct, aes(x = col_id, y = row_id)) +
+  geom_tile(aes(fill = fill_value), color = "grey70", linewidth = 0.35) +
+  geom_text(
+    aes(label = label, fontface = fontface_lab),
+    size = 3.2
+  ) +
+  scale_fill_gradientn(
+    colours = c("#E67E22", "white", "#2C7FB8"),
+    values = scales::rescale(c(neg_cap, 0, pos_cap)),
+    limits = c(neg_cap, pos_cap),
+    oob = scales::squish,
+    na.value = "grey95",
+    name = "% change"
+  ) +
+  scale_x_discrete(
+    labels = c(
+      "CC_ALL" = "ALL", "CC_OWF" = "OWF", "CC_SPILL" = "SPILL", "CC_OUT" = "OUT",
+      "OWF_ALL" = "ALL", "OWF_OWF" = "OWF", "OWF_SPILL" = "SPILL", "OWF_OUT" = "OUT",
+      "OWF + CC_ALL" = "ALL", "OWF + CC_OWF" = "OWF", "OWF + CC_SPILL" = "SPILL", "OWF + CC_OUT" = "OUT"
+    ),
+    expand = c(0, 0)
+  ) +
+  scale_y_discrete(expand = c(0, 0)) +
+  geom_vline(xintercept = c(4.5, 8.5), linewidth = 0.8) +
+  geom_hline(data = hline_df, aes(yintercept = y), inherit.aes = FALSE, linewidth = 0.8) +
+  annotate(
+    "text", x = 2.5, y = length(indicator_order) + 1.1,
+    label = "Climate change", fontface = "bold", size = 4
+  ) +
+  annotate(
+    "text", x = 6.5, y = length(indicator_order) + 1.1,
+    label = "Offshore wind farms", fontface = "bold", size = 4
+  ) +
+  annotate(
+    "text", x = 10.5, y = length(indicator_order) + 1.1,
+    label = "Offshore wind farms + climate change", fontface = "bold", size = 4
+  ) +
+  coord_cartesian(clip = "off") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(size = 10, face = "bold"),
+    axis.text.y = element_text(size = 10),
+    legend.position = "right",
+    plot.margin = margin(30, 20, 20, 20)
+  )
+
+p_pct_heatmap
+
+ggsave("Indicator_Summary_heatmap_1.png", p_pct_heatmap,widt = 9, dpi = 800)
+```
+Integrated figure
+```{r}
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(cowplot)
+```
+Prepare the plotting dataframe once
+```{r}
+# =========================================================
+# PREPARE DATA FOR GROUPED HEATMAP FIGURES
+# =========================================================
+
+plot_pct <- combined_master %>%
+  mutate(
+    scenario = factor(scenario, levels = c("CC", "OWF", "OWF + CC")),
+    zone = factor(zone, levels = c("ALL", "OWF", "SPILL", "OUT")),
+    col_id = factor(
+      paste(scenario, zone, sep = "_"),
+      levels = c(
+        "CC_ALL", "CC_OWF", "CC_SPILL", "CC_OUT",
+        "OWF_ALL", "OWF_OWF", "OWF_SPILL", "OWF_OUT",
+        "OWF + CC_ALL", "OWF + CC_OWF", "OWF + CC_SPILL", "OWF + CC_OUT"
+      )
+    ),
+    label = ifelse(
+      is.na(pct_change),
+      "NA",
+      paste0(
+        ifelse(pct_change > 0, "+", ""),
+        formatC(pct_change, format = "f", digits = 1),
+        "%"
+      )
+    ),
+    indicator_group = case_when(
+      indicator %in% c("Total B", "Fish B", "Invertebrates B", "Demersal B", "Pelagic B", "Commercial B") ~ "Biomass",
+      indicator %in% c("Total C", "Fish C", "Invertebrate C", "Demersal C", "Pelagic C") ~ "Catch",
+      indicator %in% c("TL community", "TL community 3,25", "TL catch") ~ "Trophic level",
+      indicator %in% c("FCI", "H", "RDC", "SOI") ~ "Ecological Network Analysis",
+      TRUE ~ "Other"
+    )
+  )
+```
+
+Define the row order within groups
+```{r}
+group_orders <- list(
+  "Biomass" = c("Total B", "Fish B", "Invertebrates B", "Demersal B", "Pelagic B", "Commercial B"),
+  "Catch" = c("Total C", "Fish C", "Invertebrate C", "Demersal C", "Pelagic C"),
+  "Trophic level" = c("TL community", "TL community 3,25", "TL catch"),
+  "Ecological Network Analysis" = c("FCI", "H", "RDC", "SOI")
+)
+```
+
+Plotting function
+```{r}
+make_pct_heatmap_group <- function(data, group_name, show_top_axis = TRUE, show_legend = TRUE) {
+  
+  x_levels <- c(
+  "CC_ALL", "CC_OWF", "CC_SPILL", "CC_OUT",
+  "OWF_ALL", "OWF_OWF", "OWF_SPILL", "OWF_OUT",
+  "OWF + CC_ALL", "OWF + CC_OWF", "OWF + CC_SPILL", "OWF + CC_OUT"
+)
+  
+  df <- data %>%
+  filter(indicator_group == group_name) %>%
+  mutate(
+    indicator = factor(indicator, levels = group_orders[[group_name]]),
+    row_id = factor(as.character(indicator), levels = rev(group_orders[[group_name]])),
+    col_id = factor(as.character(col_id), levels = x_levels)
+  )
+  
+  neg_cap <- df %>%
+    filter(!is.na(pct_change), pct_change != -100) %>%
+    summarise(cap = min(pct_change)) %>%
+    pull(cap)
+  
+  pos_cap <- df %>%
+    filter(!is.na(pct_change)) %>%
+    summarise(cap = max(pct_change)) %>%
+    pull(cap)
+  
+  if (!is.finite(neg_cap)) neg_cap <- -1
+  if (!is.finite(pos_cap)) pos_cap <- 1
+  
+df <- df %>%
+  mutate(
+    is_minus100 = !is.na(pct_change) & pct_change == -100,
+    fill_value = case_when(
+      is.na(pct_change) ~ NA_real_,
+      pct_change == -100 ~ NA_real_,
+      pct_change < neg_cap ~ neg_cap,
+      pct_change > pos_cap ~ pos_cap,
+      TRUE ~ pct_change
+    ),
+    fontface_lab = ifelse(is_minus100, "bold", "plain")
+  )
+
+p <- ggplot(df, aes(x = col_id, y = row_id)) +
+  geom_tile(
+    data = df %>% filter(is_minus100),
+    fill = "grey70",
+    color = "grey70",
+    linewidth = 0.35
+  ) +
+  geom_tile(
+    data = df %>% filter(!is_minus100),
+    aes(fill = fill_value),
+    color = "grey70",
+    linewidth = 0.35
+  ) +
+  geom_text(aes(label = label, fontface = fontface_lab), size = 3.2) +
+  scale_fill_gradientn(
+    colours = c("#E67E22", "white", "#2C7FB8"),
+    values = scales::rescale(c(neg_cap, 0, pos_cap)),
+    limits = c(neg_cap, pos_cap),
+    oob = scales::squish,
+    na.value = "grey95",
+    name = "% change"
+  ) +
+    scale_x_discrete(
+  limits = x_levels,
+  labels = c(
+    "CC_ALL" = "ALL", "CC_OWF" = "OWF", "CC_SPILL" = "SPILL", "CC_OUT" = "OUT",
+    "OWF_ALL" = "ALL", "OWF_OWF" = "OWF", "OWF_SPILL" = "SPILL", "OWF_OUT" = "OUT",
+    "OWF + CC_ALL" = "ALL", "OWF + CC_OWF" = "OWF", "OWF + CC_SPILL" = "SPILL", "OWF + CC_OUT" = "OUT"
+  ),
+  expand = c(0, 0),
+  position = "top"
+) +
+    scale_y_discrete(expand = c(0, 0)) +
+    geom_vline(xintercept = c(4.5, 8.5), linewidth = 0.8) +
+    labs(x = NULL, y = NULL, title = group_name) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0, size = 12),
+      axis.text.y = element_text(size = 10),
+      axis.text.x.top = element_text(size = 10, face = "bold"),
+      axis.ticks.x.top = element_blank(),
+      axis.text.x.bottom = element_blank(),
+      axis.ticks.x.bottom = element_blank(),
+      plot.margin = margin(8, 20, 10, 20),
+      legend.position = "right",
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 9)
+    )
+  
+  if (!show_legend) {
+    p <- p + theme(legend.position = "none")
+  } else {
+    p <- p +
+      guides(
+        fill = guide_colorbar(
+          barheight = unit(2.8, "cm"),
+          barwidth = unit(0.45, "cm"),
+          ticks.colour = "black",
+          frame.colour = "black"
+        )
+      )
+  }
+  
+  p
+}
+```
+
+Separate scenario headers
+```{r}
+library(ggplot2)
+
+scenario_header_plot <- ggplot() +
+  annotate("text", x = 2.5, y = 1, label = "CC", fontface = "bold", size = 5) +
+  annotate("text", x = 6.5, y = 1, label = "OWF", fontface = "bold", size = 5) +
+  annotate("text", x = 10.5, y = 1, label = "OWF + CC", fontface = "bold", size = 5) +
+  geom_vline(xintercept = c(4.5, 8.5), linewidth = 0.8) +
+  scale_x_continuous(limits = c(0.5, 12.5), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0.5, 1.5), expand = c(0, 0)) +
+  theme_void() +
+  theme(
+    plot.margin = margin(0, 20, -5, 20)
+  )
+
+scenario_header_plot
+```
+
+
+Build the 4 plots
+```{r}
+p_biomass <- make_pct_heatmap_group(plot_pct, "Biomass", show_top_axis = TRUE, show_legend = FALSE)
+p_catch   <- make_pct_heatmap_group(plot_pct, "Catch", show_top_axis = TRUE, show_legend = FALSE)
+p_tl      <- make_pct_heatmap_group(plot_pct, "Trophic level", show_top_axis = TRUE, show_legend = FALSE)
+p_ena     <- make_pct_heatmap_group(plot_pct, "Ecological Network Analysis", show_top_axis = TRUE, show_legend = FALSE)
+```
+
+Align and combine them
+```{r}
+library(cowplot)
+
+aligned_plots <- align_plots(
+  scenario_header_plot,
+  p_biomass, p_catch, p_tl, p_ena,
+  align = "v",
+  axis = "lr"
+)
+
+combined_heatmap <- plot_grid(
+  aligned_plots[[1]],
+  aligned_plots[[2]],
+  aligned_plots[[3]],
+  aligned_plots[[4]],
+  aligned_plots[[5]],
+  ncol = 1,
+  rel_heights = c(0.55, 6, 5, 3, 4)
+)
+
+combined_heatmap
+
+ggsave(
+  filename = file.path(out_dir, "Pct_change_heatmap_grouped.png"),
+  plot = combined_heatmap,
+  width = 8.5,
+  height = 9,
+  dpi = 800,
+  bg = "white"
+)
+```
+

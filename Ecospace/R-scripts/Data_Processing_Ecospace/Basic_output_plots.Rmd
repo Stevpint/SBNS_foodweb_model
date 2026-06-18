@@ -1,0 +1,1293 @@
+---
+title: "Basic_outputs_plots"
+author: "Dries Lorré"
+date: "2026-03-11"
+output: html_document
+---
+
+In this script, the species-specific biomass, species-specific catch and fleet-specific effort maps are processed and plotted.
+
+Packages
+```{r}
+library(terra)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(ggplot2)
+library(tidyr)
+```
+Main directories
+```{r}
+scenario_dirs <- c(
+  Baseline  = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_baseline_test",
+  CC        = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_CC_test",
+  OWF       = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_test",
+  OWF_CC    = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_CC_test"
+)
+
+# Folder name inside each scenario
+asc_subfolder <- file.path("Test_Env_resps", "asc")
+
+# Output folder
+out_dir <- file.path(getwd(), "Basic_output_plots")
+
+if (!dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE)
+}
+
+cat("Output figures will be saved in:\n", out_dir, "\n")
+```
+
+Keep time steps for last 10 years
+```{r}
+# Last timestep = 1920
+# Yearly maps are every 12 steps
+# Last 10 years = 1812, 1824, ..., 1920
+target_steps <- seq(1812, 1920, by = 12)
+target_steps_chr <- sprintf("%05d", target_steps)
+```
+
+Definition of the metrics
+```{r}
+metrics <- list(
+  biomass = list(
+    prefix = "EcospaceMapBiomass-",
+    type   = "group"
+  ),
+  catch = list(
+    prefix = "EcospaceMapCatch-",
+    type   = "group"
+  ),
+  discards = list(
+    prefix = "EcospaceMapDiscards-",
+    type   = "group"
+  ),
+  habitat_capacity = list(
+    prefix = "LayerHabitatCapacity-",
+    type   = "group"
+  ),
+  effort = list(
+    prefix = "EcospaceMapEffort-",
+    type   = "fleet"
+  )
+)
+```
+
+Helper functions
+```{r}
+# Extract timestep from filename
+extract_timestep <- function(x) {
+  as.integer(str_extract(basename(x), "(?<=-)\\d{5}(?=\\.asc$)"))
+}
+
+# Extract group/fleet name from filename:
+# removes prefix and trailing "-00012.asc"
+extract_entity_name <- function(x, prefix) {
+  nm <- basename(x)
+  nm <- str_remove(nm, paste0("^", stringr::fixed(prefix)))
+  nm <- str_remove(nm, "-\\d{5}\\.asc$")
+  nm
+}
+
+# Build full asc folder path for a scenario
+get_asc_dir <- function(scenario_path) {
+  file.path(scenario_path, asc_subfolder)
+}
+
+# Read and average rasters for a single group/fleet over selected timesteps
+average_entity_rasters <- function(files) {
+  r_list <- lapply(files, rast)
+  r_stack <- rast(r_list)
+  app(r_stack, fun = mean, na.rm = TRUE)
+}
+
+# Convert raster to dataframe for ggplot
+raster_to_df <- function(r, entity_name, scenario_name, metric_name) {
+  df <- as.data.frame(r, xy = TRUE, na.rm = FALSE)
+  names(df)[3] <- "value"
+  df$entity <- entity_name
+  df$scenario <- scenario_name
+  df$metric <- metric_name
+  df
+}
+
+# Process one metric for one scenario
+process_metric_scenario <- function(scenario_name, scenario_path, metric_name, metric_info) {
+  
+  asc_dir <- get_asc_dir(scenario_path)
+  
+  if (!dir.exists(asc_dir)) {
+    warning("ASC directory not found for scenario: ", scenario_name, " -> ", asc_dir)
+    return(NULL)
+  }
+  
+  all_files <- list.files(asc_dir, pattern = "\\.asc$", full.names = TRUE)
+  
+  # Keep only files for this metric
+  metric_files <- all_files[str_detect(basename(all_files), paste0("^", fixed(metric_info$prefix)))]
+  
+  if (length(metric_files) == 0) {
+    warning("No files found for metric '", metric_name, "' in scenario: ", scenario_name)
+    return(NULL)
+  }
+  
+  # Extract timestep and keep only last 10 years
+  file_info <- tibble(
+    file = metric_files,
+    timestep = extract_timestep(metric_files),
+    entity = extract_entity_name(metric_files, metric_info$prefix)
+  ) %>%
+    filter(timestep %in% target_steps)
+  
+  if (nrow(file_info) == 0) {
+    warning("No matching last-10-year files found for metric '", metric_name,
+            "' in scenario: ", scenario_name)
+    return(NULL)
+  }
+  
+  # Check whether entities have complete 10-year series
+  completeness <- file_info %>%
+    count(entity, name = "n_files") %>%
+    mutate(complete = n_files == length(target_steps))
+  
+  incomplete_entities <- completeness %>%
+    filter(!complete)
+  
+  if (nrow(incomplete_entities) > 0) {
+    message("Scenario: ", scenario_name,
+            " | Metric: ", metric_name,
+            " | Some entities do not have all 10 target timesteps.")
+    print(incomplete_entities)
+  }
+  
+  # Average raster for each entity
+  entity_dfs <- file_info %>%
+    arrange(entity, timestep) %>%
+    group_split(entity) %>%
+    lapply(function(df_ent) {
+      ent_name <- unique(df_ent$entity)
+      message("Processing ", scenario_name, " | ", metric_name, " | ", ent_name)
+      
+      r_mean <- average_entity_rasters(df_ent$file)
+      raster_to_df(r_mean, ent_name, scenario_name, metric_name)
+    })
+  
+  bind_rows(entity_dfs)
+}
+
+# Function to make a faceted plot
+plot_metric_maps <- function(df_metric, scenario_name, metric_name, out_dir,
+                             ncol = NULL, width = 16, height = 10) {
+  
+  if (is.null(df_metric) || nrow(df_metric) == 0) {
+    warning("No data to plot for ", scenario_name, " - ", metric_name)
+    return(NULL)
+  }
+  
+  n_entities <- dplyr::n_distinct(df_metric$entity)
+  
+  if (is.null(ncol)) {
+    ncol <- ceiling(sqrt(n_entities))
+  }
+  
+  if (scenario_name == "Baseline") {
+    
+    p <- ggplot(df_metric, aes(x = x, y = y, fill = plot_value)) +
+      geom_raster() +
+      coord_equal() +
+      facet_wrap(~ entity, ncol = ncol) +
+      scale_fill_viridis_c(
+        option = "magma",
+        na.value = "grey90"
+      ) +
+      labs(
+        title = paste0(str_to_title(gsub("_", " ", metric_name)),
+                       " maps (mean of last 10 years)"),
+        subtitle = "Baseline scenario | absolute values",
+        x = "Longitude",
+        y = "Latitude",
+        fill = "Mean value"
+      ) +
+      theme_bw() +
+      theme(
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10),
+        strip.text = element_text(size = 8),
+        panel.grid = element_blank(),
+        legend.position = "right"
+      )
+    
+  } else {
+    
+    p <- ggplot(df_metric, aes(x = x, y = y, fill = plot_value)) +
+      geom_raster() +
+      coord_equal() +
+      facet_wrap(~ entity, ncol = ncol) +
+      scale_fill_gradient2(
+        low = "steelblue",
+        mid = "white",
+        high = "firebrick",
+        midpoint = 0,
+        na.value = "grey90",
+        labels = function(x) paste0(x, "%")
+      ) +
+      labs(
+        title = paste0(str_to_title(gsub("_", " ", metric_name)),
+                       " maps (mean of last 10 years)"),
+        subtitle = paste0("Scenario: ", scenario_name, " | % change relative to Baseline"),
+        x = "Longitude",
+        y = "Latitude",
+        fill = "% change"
+      ) +
+      theme_bw() +
+      theme(
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10),
+        strip.text = element_text(size = 8),
+        panel.grid = element_blank(),
+        legend.position = "right"
+      )
+  }
+  
+  print(p)
+  
+  out_file <- file.path(
+    out_dir,
+    paste0("MapGrid_", metric_name, "_", scenario_name, "_last10yrs_mean.png")
+  )
+  
+  ggsave(out_file, p, width = width, height = height, dpi = 300)
+  
+  return(p)
+}
+```
+
+Process data for all scenrio's
+```{r}
+all_results <- list()
+
+for (sc_name in names(scenario_dirs)) {
+  sc_path <- scenario_dirs[[sc_name]]
+  
+  message("====================================================")
+  message("SCENARIO: ", sc_name)
+  message("====================================================")
+  
+  all_results[[sc_name]] <- list()
+  
+  for (met_name in names(metrics)) {
+    message("---- Metric: ", met_name)
+    
+    res <- process_metric_scenario(
+      scenario_name = sc_name,
+      scenario_path = sc_path,
+      metric_name   = met_name,
+      metric_info   = metrics[[met_name]]
+    )
+    
+    all_results[[sc_name]][[met_name]] <- res
+  }
+}
+
+```
+
+Baseline Plotting:
+```{r}
+library(patchwork)
+library(scales)
+```
+
+
+```{r}
+# Flatten all results
+all_df <- bind_rows(
+  lapply(all_results, function(x) bind_rows(x))
+)
+
+# Keep only baseline
+baseline_df <- all_df %>%
+  filter(scenario == "Baseline")
+
+baseline_habcap_df <- baseline_df %>%
+  filter(metric == "habitat_capacity")
+
+# Read in study area land mass for plotting
+library(sf)
+
+land_main <- readRDS(
+  "land_main_study_area.rds"
+)
+```
+
+Helper functions
+```{r}
+#-----------------------------------------------------------
+# Prepare baseline data for one metric
+#-----------------------------------------------------------
+prepare_baseline_metric <- function(df, metric_name) {
+  
+  df %>%
+    filter(metric == metric_name) %>%
+    group_by(entity) %>%
+    mutate(
+      mean_abs = mean(value, na.rm = TRUE),
+      rel_value = ifelse(!is.na(mean_abs) & mean_abs != 0, value / mean_abs, NA_real_),
+      rel_min = min(rel_value, na.rm = TRUE),
+      rel_max = max(rel_value, na.rm = TRUE)
+    ) %>%
+    ungroup()
+}
+
+
+#-----------------------------------------------------------
+# Build one subplot for one entity
+#-----------------------------------------------------------
+# make_baseline_subplot <- function(df_entity, metric_name,
+#                                   show_x = FALSE,
+#                                   show_y = FALSE) {
+#   
+#   ent_name <- unique(df_entity$entity)
+#   mean_abs <- unique(df_entity$mean_abs)
+#   rel_min  <- unique(df_entity$rel_min)
+#   rel_max  <- unique(df_entity$rel_max)
+#   
+#   # safeguards
+#   if (length(mean_abs) > 1) mean_abs <- mean(mean_abs, na.rm = TRUE)
+#   if (length(rel_min)  > 1) rel_min  <- min(rel_min, na.rm = TRUE)
+#   if (length(rel_max)  > 1) rel_max  <- max(rel_max, na.rm = TRUE)
+#   
+#   # sparse axis breaks
+#   x_breaks <- pretty(range(df_entity$x, na.rm = TRUE), n = 3)
+#   y_breaks <- pretty(range(df_entity$y, na.rm = TRUE), n = 3)
+#   
+#   p <- ggplot(df_entity, aes(x = x, y = y, fill = rel_value)) +
+#     geom_raster() +
+#     coord_equal() +
+#     scale_x_continuous(breaks = x_breaks) +
+#     scale_y_continuous(breaks = y_breaks) +
+#     scale_fill_distiller(
+#       palette = "Spectral",
+#       direction = -1,
+#       limits = c(rel_min, rel_max),
+#       breaks = pretty(c(rel_min, rel_max), n = 3),
+#       labels = label_number(accuracy = 0.1),
+#       na.value = "grey80",
+#       guide = guide_colorbar(
+#         title.position = "top",
+#         barheight = unit(10, "mm"),
+#         barwidth  = unit(4, "mm"),
+#         frame.colour = "black",
+#         ticks.colour = "black"
+#       )
+#     ) +
+#     labs(
+#       title = ent_name,
+#       subtitle = paste0("Mean = ", signif(mean_abs, 4)),
+#       x = if (show_x) "Longitude" else NULL,
+#       y = if (show_y) "Latitude" else NULL,
+#       fill = "Relative\nvalue"
+#     ) +
+#     theme_bw(base_size = 11) +
+#     theme(
+#       plot.title = element_text(face = "bold", size = 13),
+#       plot.subtitle = element_text(size = 13),
+#       axis.title = element_text(size = 13),
+#       axis.text = element_text(size = 13),
+#       legend.title = element_text(size = 12),
+#       legend.text = element_text(size = 12),
+#       panel.grid = element_blank(),
+#       
+#       # place legend INSIDE panel
+#       legend.position = c(0.99, 0.02),
+#       legend.justification = c(1, 0),
+#       
+#       # make legend readable but compact
+#       legend.direction = "vertical",
+#       legend.box.background = element_rect(
+#         colour = "black",
+#         fill = scales::alpha("white", 0.75)
+#       ),
+#       legend.background = element_rect(
+#         fill = scales::alpha("white", 0.75),
+#         colour = NA
+#       ),
+#       legend.margin = margin(2, 2, 2, 2),
+#       legend.key.height = unit(0.45, "cm"),
+#       legend.key.width  = unit(0.30, "cm")
+#     )
+#   
+#   if (!show_x) {
+#     p <- p + theme(
+#       axis.text.x = element_blank(),
+#       axis.ticks.x = element_blank()
+#     )
+#   }
+#   
+#   if (!show_y) {
+#     p <- p + theme(
+#       axis.text.y = element_blank(),
+#       axis.ticks.y = element_blank()
+#     )
+#   }
+#   
+#   return(p)
+# }
+
+# --NEW-------------------------------------------------------------------
+make_baseline_subplot <- function(df_entity, metric_name,
+                                  show_x = FALSE,
+                                  show_y = FALSE) {
+  
+  ent_name <- unique(df_entity$entity)
+  mean_abs <- unique(df_entity$mean_abs)
+  
+  # safeguards
+  if (length(mean_abs) > 1) mean_abs <- mean(mean_abs, na.rm = TRUE)
+  
+  # robust panel-specific limits based on rel_value
+  panel_min <- quantile(df_entity$rel_value, probs = 0.01, na.rm = TRUE)
+  panel_max <- quantile(df_entity$rel_value, probs = 0.99, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- min(df_entity$rel_value, na.rm = TRUE)
+  if (!is.finite(panel_max)) panel_max <- max(df_entity$rel_value, na.rm = TRUE)
+  
+  if (panel_min == panel_max) {
+    panel_max <- panel_min + 1e-6
+  }
+  
+  # sparse axis breaks
+  x_breaks <- pretty(range(df_entity$x, na.rm = TRUE), n = 3)
+  y_breaks <- pretty(range(df_entity$y, na.rm = TRUE), n = 3)
+  
+  p <- ggplot(df_entity, aes(x = x, y = y, fill = rel_value)) +
+    geom_raster() +
+    geom_sf(
+      data = land_main,
+      inherit.aes = FALSE,
+      fill = "grey85",
+      colour = "grey45",
+      linewidth = 0.2
+      ) +
+    coord_sf(
+      xlim = range(df_entity$x, na.rm = TRUE),
+      ylim = range(df_entity$y, na.rm = TRUE),
+      expand = FALSE
+      ) +
+    scale_x_continuous(breaks = x_breaks) +
+    scale_y_continuous(breaks = y_breaks) +
+    scale_fill_distiller(
+      palette = "Spectral",
+      direction = -1,
+      limits = c(panel_min, panel_max),
+      oob = scales::squish,
+      breaks = pretty(c(panel_min, panel_max), n = 3),
+      labels = label_number(accuracy = 0.1),
+      na.value = "white",
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(10, "mm"),
+        barwidth  = unit(4, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(
+      title = ent_name,
+      subtitle = paste0("Mean = ", signif(mean_abs, 4)),
+      x = if (show_x) "Longitude" else NULL,
+      y = if (show_y) "Latitude" else NULL,
+      fill = "Relative\nvalue"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 13),
+      axis.title = element_text(size = 13),
+      axis.text = element_text(size = 13),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 12),
+      panel.grid = element_blank(),
+      
+      # place legend INSIDE panel
+      legend.position = c(0.99, 0.02),
+      legend.justification = c(1, 0),
+      
+      # make legend readable but compact
+      legend.direction = "vertical",
+      legend.box.background = element_rect(
+        colour = "black",
+        fill = scales::alpha("white", 0.75)
+      ),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0.75),
+        colour = NA
+      ),
+      legend.margin = margin(2, 2, 2, 2),
+      legend.key.height = unit(0.45, "cm"),
+      legend.key.width  = unit(0.30, "cm")
+    )
+  
+  if (!show_x) {
+    p <- p + theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  }
+  
+  if (!show_y) {
+    p <- p + theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+  }
+  
+  return(p)
+}
+#-----------------------------------------------------------
+# Build one habitat capacity subplot for one entity
+#-----------------------------------------------------------
+make_baseline_habcap_subplot <- function(df_entity,
+                                         show_x = FALSE,
+                                         show_y = FALSE) {
+  
+  ent_name <- unique(df_entity$entity)
+  
+  # sparse axis breaks
+  x_breaks <- pretty(range(df_entity$x, na.rm = TRUE), n = 3)
+  y_breaks <- pretty(range(df_entity$y, na.rm = TRUE), n = 3)
+  
+  p <- ggplot(df_entity, aes(x = x, y = y, fill = value)) +
+    geom_raster() +
+    geom_sf(
+      data = land_main,
+      inherit.aes = FALSE,
+      fill = "grey85",
+      colour = "grey45",
+      linewidth = 0.2
+      ) +
+    coord_sf(
+      xlim = range(df_entity$x, na.rm = TRUE),
+      ylim = range(df_entity$y, na.rm = TRUE),
+      expand = FALSE
+      ) +
+    scale_x_continuous(breaks = x_breaks) +
+    scale_y_continuous(breaks = y_breaks) +
+    # scale_fill_gradient(
+    #   low = "white",
+    #   high = "#1B5F6A",
+    #   limits=c(0,1.2),
+    #   breaks = c(0, 1.2),
+    #   labels = c("LOW", "HIGH"),
+    scale_fill_gradientn(
+  colours = (RColorBrewer::brewer.pal(11, "Spectral")[6:11]),
+  limits = c(0, 1.2),
+  breaks = c(0, 1.2),
+  labels = c("LOW", "HIGH"),
+      # labels = label_number(accuracy = 0.1),
+      na.value = "white",
+      guide = guide_colorbar(
+        title.position = "top",
+        title.hjust = 0.5,
+        direction = "horizontal",
+        barheight = unit(4, "mm"),
+        barwidth  = unit(70, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(
+      title = ent_name,
+      x = if (show_x) "Longitude" else NULL,
+      y = if (show_y) "Latitude" else NULL,
+      fill = "Habitat capacity"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      axis.title = element_text(size = 13),
+      axis.text = element_text(size = 13),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 12),
+      panel.grid = element_blank()
+    )
+  
+  if (!show_x) {
+    p <- p + theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  }
+  
+  if (!show_y) {
+    p <- p + theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+  }
+  
+  return(p)
+}
+
+#-----------------------------------------------------------
+# Split vector into pages of max n items
+#-----------------------------------------------------------
+split_into_pages <- function(x, n = 20) {
+  split(x, ceiling(seq_along(x) / n))
+}
+
+
+#-----------------------------------------------------------
+# Make paginated baseline plots for one metric
+#-----------------------------------------------------------
+plot_baseline_metric_pages <- function(df_metric, metric_name, out_dir,
+                                       ncol = 4, nrow = 5,
+                                       width = 15.5, height = 18) {
+  
+  entities <- unique(df_metric$entity)
+  entity_pages <- split_into_pages(entities, n = ncol * nrow)
+  
+  page_plots <- list()
+  
+  for (i in seq_along(entity_pages)) {
+    
+    ents_this_page <- entity_pages[[i]]
+    n_panels <- length(ents_this_page)
+    n_rows_used <- ceiling(n_panels / ncol)
+    
+    subplot_list <- list()
+    
+    for (j in seq_along(ents_this_page)) {
+      
+      ent <- ents_this_page[j]
+      df_ent <- df_metric %>% filter(entity == ent)
+      
+      row_pos <- ceiling(j / ncol)
+      col_pos <- j %% ncol
+      if (col_pos == 0) col_pos <- ncol
+      
+      show_x <- row_pos == n_rows_used
+      show_y <- col_pos == 1
+      
+      subplot_list[[j]] <- make_baseline_subplot(
+        df_ent,
+        metric_name,
+        show_x = show_x,
+        show_y = show_y
+      )
+    }
+    
+    combined_plot <- wrap_plots(subplot_list, ncol = ncol, nrow = n_rows_used)
+    
+    page_title <- paste0(
+      str_to_title(gsub("_", " ", metric_name)),
+      " | Baseline spatial distribution (relative to layer mean) | Plot ",
+      i, "/", length(entity_pages)
+    )
+    
+    combined_plot <- combined_plot +
+      plot_annotation(title = page_title)
+    
+    print(combined_plot)
+    
+    out_file <- file.path(
+      out_dir,
+      paste0("Baseline_", metric_name, "_relative_distribution_page_", i, ".png")
+    )
+    
+    ggsave(out_file, combined_plot, width = width, height = height, dpi = 800)
+    
+    page_plots[[i]] <- combined_plot
+  }
+  
+  return(page_plots)
+}
+
+#-----------------------------------------------------------
+# Make paginated baseline habitat capacity plots
+# with shared horizontal legend at bottom
+#-----------------------------------------------------------
+plot_baseline_habcap_pages <- function(df_metric, out_dir,
+                                       ncol = 4, nrow = 5,
+                                       width = 15.5, height = 18) {
+  
+  entities <- unique(df_metric$entity)
+  entity_pages <- split_into_pages(entities, n = ncol * nrow)
+  
+  page_plots <- list()
+  
+  for (i in seq_along(entity_pages)) {
+    
+    ents_this_page <- entity_pages[[i]]
+    
+    subplot_list <- list()
+    
+    n_panels <- length(ents_this_page)
+    n_rows_used <- ceiling(n_panels / ncol)
+    
+    for (j in seq_along(ents_this_page)) {
+      
+      ent <- ents_this_page[j]
+      df_ent <- df_metric %>% filter(entity == ent)
+      
+      row_pos <- ceiling(j / ncol)
+      col_pos <- j %% ncol
+      if (col_pos == 0) col_pos <- ncol
+      
+      show_x <- row_pos == n_rows_used
+      show_y <- col_pos == 1
+      
+      subplot_list[[j]] <- make_baseline_habcap_subplot(
+        df_ent,
+        show_x = show_x,
+        show_y = show_y
+      )
+    }
+    
+    n_panels <- length(ents_this_page)
+n_rows_used <- ceiling(n_panels / ncol)
+
+combined_plot <- wrap_plots(subplot_list, ncol = ncol, nrow = n_rows_used, guides = "collect") &
+      theme(
+        legend.position = "bottom",
+        legend.direction = "horizontal"
+      )
+    
+    page_title <- paste0(
+      "Habitat Capacity | Baseline | Plot ",
+      i, "/", length(entity_pages)
+    )
+    
+    combined_plot <- combined_plot +
+      plot_annotation(title = page_title)
+    
+    print(combined_plot)
+    
+    out_file <- file.path(
+      out_dir,
+      paste0("Baseline_habitat_capacity_page_", i, ".png")
+    )
+    
+    ggsave(out_file, combined_plot, width = width, height = height, dpi = 800)
+    
+    page_plots[[i]] <- combined_plot
+  }
+  
+  return(page_plots)
+}
+```
+
+Plot Baseline metrics
+```{r}
+############################################################
+# MAKE BASELINE PLOTS
+############################################################
+
+# Plot for Biomass, Catch, Discards and Effort
+baseline_plot_list <- list()
+
+metrics_baseline <- c("biomass", "catch", "discards", "effort")
+# add "habitat_capacity" here too if you want it in the same style:
+# metrics_baseline <- c("biomass", "catch", "discards", "effort", "habitat_capacity")
+
+for (met_name in metrics_baseline) {
+  
+  message("====================================================")
+  message("BASELINE PLOTS FOR: ", met_name)
+  message("====================================================")
+  
+  df_metric <- prepare_baseline_metric(baseline_df, met_name)
+  
+  baseline_plot_list[[met_name]] <- plot_baseline_metric_pages(
+    df_metric   = df_metric,
+    metric_name = met_name,
+    out_dir     = out_dir,
+    ncol        = 4,
+    nrow        = 5
+  )
+}
+
+# Habitat Capacity plot
+baseline_habcap_plots <- plot_baseline_habcap_pages(
+  df_metric = baseline_habcap_df,
+  out_dir   = out_dir,
+  ncol      = 4,
+  nrow      = 5,
+  width     = 15.5,
+  height    = 18
+)
+```
+
+
+
+
+
+Build plot dataframe with baseline absolute values and % change for other scenarios
+```{r}
+all_df <- bind_rows(
+  lapply(all_results, function(x) bind_rows(x))
+)
+
+baseline_ref <- all_df %>%
+  filter(scenario == "Baseline") %>%
+  select(metric, entity, x, y, baseline_value = value)
+
+plot_df <- all_df %>%
+  left_join(baseline_ref, by = c("metric", "entity", "x", "y")) %>%
+  mutate(
+    plot_value = case_when(
+      scenario == "Baseline" ~ value,
+      scenario != "Baseline" & !is.na(baseline_value) & baseline_value != 0 ~
+        ((value - baseline_value) / baseline_value) * 100,
+      TRUE ~ NA_real_
+    )
+  )
+
+# Optional diagnostic
+plot_df %>%
+  group_by(scenario, metric) %>%
+  summarise(
+    n_cells = n(),
+    n_na_plot = sum(is.na(plot_value)),
+    .groups = "drop"
+  )
+```
+
+Plots
+```{r}
+# plot_list <- list()
+# 
+# for (sc_name in unique(plot_df$scenario)) {
+#   
+#   plot_list[[sc_name]] <- list()
+#   
+#   for (met_name in unique(plot_df$metric)) {
+#     
+#     df_sub <- plot_df %>%
+#       filter(scenario == sc_name, metric == met_name)
+#     
+#     p <- plot_metric_maps(
+#       df_metric     = df_sub,
+#       scenario_name = sc_name,
+#       metric_name   = met_name,
+#       out_dir       = out_dir
+#     )
+#     
+#     plot_list[[sc_name]][[met_name]] <- p
+#   }
+# }
+```
+
+SCENARIO plots
+```{r}
+library(patchwork)
+library(RColorBrewer)
+library(scales)
+```
+
+
+```{r}
+############################################################
+# SCENARIO PLOTS
+# % change relative to baseline
+############################################################
+
+# Flatten all processed results
+all_df <- bind_rows(
+  lapply(all_results, function(x) bind_rows(x))
+)
+
+# Baseline reference per metric/entity/grid cell
+baseline_ref <- all_df %>%
+  filter(scenario == "Baseline") %>%
+  select(metric, entity, x, y, baseline_value = value)
+
+# Scenario data with % change vs baseline
+scenario_plot_df <- all_df %>%
+  filter(scenario != "Baseline") %>%
+  left_join(baseline_ref, by = c("metric", "entity", "x", "y")) %>%
+  mutate(
+    pct_change = case_when(
+      baseline_value == 0 & value == 0 ~ 0,
+      baseline_value == 0 & value != 0 ~ NA_real_,
+      !is.na(baseline_value) ~ ((value - baseline_value) / baseline_value) * 100,
+      TRUE ~ NA_real_
+    ),
+    scenario = factor(scenario, levels = c("CC", "OWF", "OWF_CC"),
+                      labels = c("CC", "OWF", "OWF + CC"))
+  )
+```
+
+Helper function to prepare one metric
+```{r}
+prepare_scenario_metric <- function(df, metric_name, cap_percent = 100) {
+  
+  df_metric <- df %>%
+    filter(metric == metric_name)
+  
+  max_abs_change <- df_metric %>%
+    summarise(max_abs = max(abs(pct_change), na.rm = TRUE)) %>%
+    pull(max_abs)
+  
+  if (!is.finite(max_abs_change)) max_abs_change <- cap_percent
+  
+  max_abs_change <- min(max_abs_change, cap_percent)
+  
+  df_metric %>%
+    mutate(
+      pct_change_plot = pmin(pmax(pct_change, -max_abs_change), max_abs_change),
+      scale_limit = max_abs_change
+    )
+}
+```
+
+Subplot function
+```{r}
+# make_scenario_subplot <- function(df_panel,
+#                                   show_x = FALSE,
+#                                   show_y = FALSE,
+#                                   show_title = TRUE) {
+#   
+#   scen_name <- unique(df_panel$scenario)
+#   
+#   # actual min and max per panel
+#   panel_min <- min(df_panel$pct_change, na.rm = TRUE)
+#   panel_max <- max(df_panel$pct_change, na.rm = TRUE)
+#   
+#   # safeguard
+#   if (!is.finite(panel_min)) panel_min <- -1
+#   if (!is.finite(panel_max)) panel_max <- 1
+#   
+#   # avoid zero-width scale
+#   if (panel_min == panel_max) {
+#     panel_min <- panel_min - 1
+#     panel_max <- panel_max + 1
+#   }
+#   
+#   x_breaks <- pretty(range(df_panel$x, na.rm = TRUE), n = 3)
+#   y_breaks <- pretty(range(df_panel$y, na.rm = TRUE), n = 3)
+#   
+#   p <- ggplot(df_panel, aes(x = x, y = y, fill = pct_change)) +
+#     geom_raster() +
+#     coord_equal() +
+#     scale_x_continuous(breaks = x_breaks) +
+#     scale_y_continuous(breaks = y_breaks) +
+#     scale_fill_gradient2(
+#       low = "#E67E22",    # orange for decrease
+#       mid = "white",
+#       high = "#2C7FB8",   # blue for increase
+#       midpoint = 0,
+#       limits = c(panel_min, panel_max),
+#       breaks = pretty(c(panel_min, panel_max), n = 3),
+#       labels = function(x) paste0(round(x, 1), "%"),
+#       na.value = "grey85",
+#       guide = guide_colorbar(
+#         title.position = "top",
+#         barheight = unit(13, "mm"),
+#         barwidth  = unit(4.5, "mm"),
+#         frame.colour = "black",
+#         ticks.colour = "black"
+#       )
+#     ) +
+#     labs(
+#       title = if (show_title) as.character(scen_name) else NULL,
+#       x = if (show_x) "Longitude" else NULL,
+#       y = if (show_y) "Latitude" else NULL,
+#       fill = "% change"
+#     ) +
+#     theme_bw(base_size = 11) +
+#     theme(
+#       plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+#       axis.title = element_text(size = 12),
+#       axis.text = element_text(size = 12),
+#       legend.title = element_text(size = 11),
+#       legend.text = element_text(size = 11),
+#       panel.grid = element_blank(),
+#       
+#       # legend inside panel
+#       legend.position = c(0.99, 0.02),
+#       legend.justification = c(1, 0),
+#       
+#       legend.box.background = element_rect(
+#         colour = "black",
+#         fill = scales::alpha("white", 0.75)
+#       ),
+#       legend.background = element_rect(
+#         fill = scales::alpha("white", 0.75),
+#         colour = NA
+#       ),
+#       legend.margin = margin(2, 2, 2, 2),
+#       legend.key.height = unit(0.4, "cm"),
+#       legend.key.width  = unit(0.25, "cm")
+#     )
+#   
+#   if (!show_x) {
+#     p <- p + theme(
+#       axis.text.x = element_blank(),
+#       axis.ticks.x = element_blank()
+#     )
+#   }
+#   
+#   if (!show_y) {
+#     p <- p + theme(
+#       axis.text.y = element_blank(),
+#       axis.ticks.y = element_blank()
+#     )
+#   }
+#   
+#   p
+# }
+# 
+
+# NEW ----------------------------------------------------------------
+make_scenario_subplot <- function(df_panel,
+                                  show_x = FALSE,
+                                  show_y = FALSE,
+                                  show_title = TRUE) {
+  
+  scen_name <- unique(df_panel$scenario)
+  
+  # robust panel-specific limits
+  panel_min <- quantile(df_panel$pct_change, probs = 0.01, na.rm = TRUE)
+  panel_max <- quantile(df_panel$pct_change, probs = 0.99, na.rm = TRUE)
+  
+  # safeguard
+  if (!is.finite(panel_min)) panel_min <- min(df_panel$pct_change, na.rm = TRUE)
+  if (!is.finite(panel_max)) panel_max <- max(df_panel$pct_change, na.rm = TRUE)
+  
+  # avoid zero-width scale
+  if (panel_min == panel_max) {
+    panel_min <- panel_min - 1
+    panel_max <- panel_max + 1
+  }
+  
+  x_breaks <- pretty(range(df_panel$x, na.rm = TRUE), n = 3)
+  y_breaks <- pretty(range(df_panel$y, na.rm = TRUE), n = 3)
+  
+  p <- ggplot(df_panel, aes(x = x, y = y, fill = pct_change)) +
+        geom_raster() +
+    geom_sf(
+      data = land_main,
+      inherit.aes = FALSE,
+      fill = "grey85",
+      colour = "grey45",
+      linewidth = 0.2
+      ) +
+    coord_sf(
+      xlim = range(df_panel$x, na.rm = TRUE),
+      ylim = range(df_panel$y, na.rm = TRUE),
+      expand = FALSE
+      ) +
+    scale_x_continuous(breaks = x_breaks) +
+    scale_y_continuous(breaks = y_breaks) +
+    scale_fill_gradient2(
+      low = "#E67E22",    # orange for decrease
+      mid = "white",
+      high = "#2C7FB8",   # blue for increase
+      midpoint = 0,
+      limits = c(panel_min, panel_max),
+      oob = scales::squish,
+      breaks = pretty(c(panel_min, panel_max), n = 3),
+      labels = function(x) paste0(round(x, 1), "%"),
+      na.value = "white",
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(13, "mm"),
+        barwidth  = unit(4.5, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(
+      title = if (show_title) as.character(scen_name) else NULL,
+      x = if (show_x) "Longitude" else NULL,
+      y = if (show_y) "Latitude" else NULL,
+      fill = "% change"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 11),
+      panel.grid = element_blank(),
+      
+      # legend inside panel
+      legend.position = c(0.99, 0.02),
+      legend.justification = c(1, 0),
+      
+      legend.box.background = element_rect(
+        colour = "black",
+        fill = scales::alpha("white", 0.75)
+      ),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0.75),
+        colour = NA
+      ),
+      legend.margin = margin(2, 2, 2, 2),
+      legend.key.height = unit(0.4, "cm"),
+      legend.key.width  = unit(0.25, "cm")
+    )
+  
+  if (!show_x) {
+    p <- p + theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  }
+  
+  if (!show_y) {
+    p <- p + theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+  }
+  
+  p
+}
+```
+
+Plot function
+```{r}
+plot_scenario_metric_pages <- function(df_metric, metric_name, out_dir,
+                                       ncol = 4, nrow_entities = 5,
+                                       width = 15.5, height = 18) {
+  
+  entities <- unique(df_metric$entity)
+  entity_pages <- split(entities, ceiling(seq_along(entities) / nrow_entities))
+  
+  page_plots <- list()
+  
+  for (i in seq_along(entity_pages)) {
+    
+    ents_this_page <- entity_pages[[i]]
+    
+    # ------------------------------------------------------
+    # Top header row with scenario names
+    # ------------------------------------------------------
+    header_plots <- list(
+      ggplot() + theme_void(),  # empty left spacer
+      ggplot() +
+        annotate("text", x = 0.5, y = 0.5, label = "CC",
+                 fontface = "bold", size = 7) +
+        xlim(0, 1) + ylim(0, 1) + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.5, y = 0.5, label = "OWF",
+                 fontface = "bold", size = 7) +
+        xlim(0, 1) + ylim(0, 1) + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.5, y = 0.5, label = "OWF + CC",
+                 fontface = "bold", size = 7) +
+        xlim(0, 1) + ylim(0, 1) + theme_void()
+    )
+    
+    header_row <- wrap_plots(header_plots, ncol = 4) +
+      plot_layout(widths = c(0.9, 3, 3, 3))
+    
+    # ------------------------------------------------------
+    # Entity blocks
+    # ------------------------------------------------------
+    entity_blocks <- list()
+    
+    for (r in seq_along(ents_this_page)) {
+      
+      ent <- ents_this_page[r]
+      df_ent <- df_metric %>% filter(entity == ent)
+      
+      # Species/fleet title above row
+      title_plot <- ggplot() +
+        annotate("text",
+                 x = 0, y = 0.5,
+                 label = ent,
+                 hjust = 0,
+                 fontface = "bold",
+                 size = 5.5) +
+        xlim(0, 1) + ylim(0, 1) +
+        theme_void()
+      
+      # Three scenario panels
+      row_plots <- list()
+      
+      for (c in 1:3) {
+        
+        scen <- levels(df_metric$scenario)[c]
+        df_panel <- df_ent %>% filter(scenario == scen)
+        
+        row_plots[[c]] <- make_scenario_subplot(
+          df_panel,
+          show_x = (r == length(ents_this_page)),
+          show_y = (c == 1),
+          show_title = FALSE   # IMPORTANT: titles now handled by header row
+        )
+      }
+      
+      row_plot <- wrap_plots(row_plots, ncol = 3)
+      
+      entity_block <- title_plot / row_plot +
+        plot_layout(heights = c(0.12, 1))
+      
+      entity_blocks[[r]] <- entity_block
+    }
+    
+    maps_block <- wrap_plots(entity_blocks, ncol = 1)
+    
+    final_plot <- header_row / maps_block +
+      plot_layout(heights = c(0.04, 1)) +
+      plot_annotation(
+        title = paste0(
+          str_to_title(gsub("_", " ", metric_name)),
+          " | % change relative to Baseline | Plot ",
+          i, "/", length(entity_pages)
+        )
+      )
+    
+    print(final_plot)
+    
+    out_file <- file.path(
+      out_dir,
+      paste0("ScenarioComparison_", metric_name, "_page_", i, ".png")
+    )
+    
+    ggsave(out_file, final_plot, width = width, height = height, dpi = 300)
+    
+    page_plots[[i]] <- final_plot
+  }
+  
+  return(page_plots)
+}
+```
+
+Run plot function for all metrics
+```{r}
+############################################################
+# MAKE SCENARIO PLOTS
+############################################################
+
+scenario_plot_list <- list()
+
+metrics_scenarios <- c("biomass", "catch", "discards", "effort", "habitat_capacity")
+
+for (met_name in metrics_scenarios) {
+  
+  message("====================================================")
+  message("SCENARIO PLOTS FOR: ", met_name)
+  message("====================================================")
+  
+  df_metric <- prepare_scenario_metric(
+    scenario_plot_df,
+    metric_name = met_name,
+    cap_percent = 100
+  )
+  
+  scenario_plot_list[[met_name]] <- plot_scenario_metric_pages(
+    df_metric      = df_metric,
+    metric_name    = met_name,
+    out_dir        = out_dir,
+    ncol           = 4,
+    nrow_entities  = 5,
+    width          = 13,
+    height         = 18
+  )
+}
+```
+

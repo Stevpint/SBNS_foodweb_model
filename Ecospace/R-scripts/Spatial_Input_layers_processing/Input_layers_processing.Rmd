@@ -1,0 +1,2462 @@
+---
+title: "Input_layers_processing"
+author: "Dries Lorré"
+date: "2026-02-09"
+output: html_document
+---
+
+NOTE: all data should be stored as ESRI ASCII raster maps after processing. This will allow both smooth Ecospace base map and STDF input
+
+Packages
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(terra)
+```
+
+Input layers (paths)
+```{r}
+# Base folder (as before)
+base_dir  <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data"
+
+path_sbns <- file.path(base_dir, "SBNS_boundary_epsg3857.shp")
+path_temp <- file.path(base_dir, "Temperature")
+path_depth <- file.path(base_dir, "Depth")
+
+out_dir <- file.path(base_dir, "Processed")
+if (!dir.exists(out_dir)) dir.create(out_dir)
+```
+
+PP - template (for raster structure - resolution - CRS)
+```{r}
+# Study area polygon
+sbns <- vect(path_sbns)
+
+temp_files <- list.files(path_temp, pattern = "\\.nc$", full.names = TRUE)
+if (length(temp_files) == 0) {
+  stop("No NetCDF files found in the Temperature folder.")
+}
+
+# Use the first SST file as grid template
+temp_template <- rast(temp_files[1])
+temp_template
+crs(temp_template)
+res(temp_template)
+ext(temp_template)
+
+# Reproject SBNS to SST CRS if needed
+if (crs(sbns) != crs(temp_template)) {
+  sbns <- project(sbns, temp_template)
+}
+
+# Crop + mask SST to SBNS; this defines the *working grid* for the study area
+temp_sbns <- crop(temp_template, sbns)
+temp_sbns <- mask(temp_sbns, sbns)
+
+temp_sbns
+res(temp_sbns)   # this is the resolution your base map will use
+ext(temp_sbns)
+
+# Base grid = first SST layer (surface temperature monthly mean)
+temp_grid <- temp_sbns[[1]]
+names(temp_grid) <- "SST"
+plot(temp_grid, main = "SST (base grid) over SBNS")
+```
+Mosaic and project depth to SST grid
+```{r}
+# --- Depth tiles ---
+depth_files <- list.files(path_depth, pattern = "\\.tif$", full.names = TRUE)
+if (length(depth_files) == 0) {
+  stop("No .tif depth tiles found in the Depth folder.")
+}
+
+# Read each tile separately
+depth_list <- lapply(depth_files, rast)
+
+# Mosaic all tiles into one bathymetry raster
+# (assumes same CRS & resolution; extents may differ/adjacent)
+depth_mosaic <- do.call(mosaic, c(depth_list, fun = "mean"))
+depth_mosaic
+crs(depth_mosaic)
+res(depth_mosaic)
+ext(depth_mosaic)
+
+# Quick plot to check the full “puzzle”
+plot(depth_mosaic, main = "Mosaic of depth tiles")
+
+# Project + resample bathymetry onto SST grid
+depth_sst <- project(depth_mosaic, temp_grid, method = "bilinear")
+
+# Restrict to SBNS polygon
+depth_sst <- crop(depth_sst, sbns)
+depth_sst <- mask(depth_sst, sbns)
+
+names(depth_sst) <- "depth"
+plot(depth_sst, main = "Bathymetry on SST grid")
+depth_range <- as.vector(global(depth_sst, fun = range, na.rm = TRUE))
+depth_range
+```
+Align depth and SST + remove islands
+```{r}
+## 1) SST main connected sea body (no islands) - as you already have
+
+# SST base grid (first layer) – you already have this
+# temp_grid <- temp_sbns[[1]]
+# names(temp_grid) <- "SST"
+
+# Mask where SST has data (1) vs no data (NA)
+sst_mask <- !is.na(temp_grid)
+sst_mask[sst_mask == 0] <- NA
+names(sst_mask) <- "sst_sea"
+
+plot(sst_mask, main = "SST mask (1 = sea cells with SST data)")
+
+# Connected patches (4-neighbour, as you set)
+sst_clumps <- patches(sst_mask, directions = 4)
+
+# Frequency of patch IDs
+clump_freq <- freq(sst_clumps)
+clump_freq
+
+# ID of the largest connected sea patch
+main_id <- clump_freq$value[which.max(clump_freq$count)]
+main_id
+
+# Mask for the main connected SST sea body
+sst_main_mask <- sst_clumps == main_id
+sst_main_mask[sst_main_mask == 0] <- NA
+names(sst_main_mask) <- "sst_main"
+
+plot(sst_main_mask, main = "Main connected SST sea patch")
+```
+
+
+```{r}
+## 2) Depth on SST grid, absolute values, restricted to main SST patch
+
+# depth_sst: you already computed this
+# depth_sst <- project(depth_mosaic, temp_grid, method = "bilinear")
+# depth_sst <- crop(depth_sst, sbns)
+# depth_sst <- mask(depth_sst, sbns)
+# names(depth_sst) <- "depth"
+
+# Convert depth to absolute values (all bathymetry positive)
+depth_sst_abs <- abs(depth_sst)
+names(depth_sst_abs) <- "depth_m"
+
+# Optional: quick check
+global(depth_sst_abs, fun = range, na.rm = TRUE)
+
+# Sea mask just for plotting (non-NA = sea)
+sea_mask <- !is.na(depth_sst_abs)
+sea_mask[sea_mask == 0] <- NA
+names(sea_mask) <- "sea"
+
+plot(sea_mask, main = "Depth-based sea mask (1 = non-NA depth)")
+
+
+# Enforce SST-based main patch on depth
+# -> guarantees that the same main body is used for all env layers
+depth_base <- mask(depth_sst_abs, sst_main_mask)
+names(depth_base) <- "depth_m"
+
+plot(depth_base, main = "Depth (abs, SST grid, main SBNS patch only)")
+global(depth_base, fun = range, na.rm = TRUE)
+```
+
+DEPTH
+```{r}
+## 3) Final “Depth” layer for your software: positive depth, 0 = land/inactive
+
+# Depth with 0 = land/inactive
+depth_base_0 <- depth_base
+depth_base_0[is.na(depth_base_0)] <- 0
+names(depth_base_0) <- "depth_m"
+
+plot(depth_base_0, main = "Depth (m, abs) on SST grid; 0 = land/inactive")
+
+# Save outputs
+writeRaster(
+  depth_base_0,
+  filename  = file.path(out_dir, "Depth.asc"),
+  overwrite = TRUE
+)
+
+writeRaster(
+  depth_base_0,
+  filename  = file.path(out_dir, "Depth_SBNS_Basegrid.tif"),
+  overwrite = TRUE
+)
+
+```
+
+PRIMARY PRODUCTION
+```{r}
+path_pp <- file.path(base_dir, "PrimaryProduction_1km_98-25")
+
+pp_files <- list.files(path_pp, pattern = "\\.nc$", full.names = TRUE)
+length(pp_files)
+
+# Helper to extract year and month from filenames like:
+# 19980101-19980131_cmems_obs-oc_atl_bgc-pp_my_l4-multi-1km_P1M.nc
+get_year_month <- function(f) {
+  b <- basename(f)
+  year <- as.integer(substr(b, 1, 4))
+  month <- as.integer(substr(b, 5, 6))
+  list(year = year, month = month)
+}
+
+ym <- lapply(pp_files, get_year_month)
+years  <- sapply(ym, `[[`, "year")
+months <- sapply(ym, `[[`, "month")
+
+# Keep only Jan 1998 – Dec 2024
+keep <- (years > 1998 | (years == 1998 & months >= 1)) &
+        (years < 2025 | (years == 2024 & months <= 12))
+
+pp_files_sel <- pp_files[keep]
+length(pp_files_sel)
+```
+Template for pp calculation
+```{r}
+# Template grid = depth_base (geometry of base layer)
+template <- depth_base
+template
+res(template)
+ext(template)
+
+# Init accumulators with zeros
+sum_PP   <- template
+count_PP <- template
+
+values(sum_PP)   <- 0
+values(count_PP) <- 0
+```
+
+```{r}
+terraOptions(progress = 1)  # show progress in long loops
+
+for (f in pp_files_sel) {
+  cat("Processing:", basename(f), "\n")
+  
+  # Read only the PP subdataset (mgC m^-2 day^-1)
+  # (If this errors, you can try sds(f) to list subdatasets)
+  pp_raw <- rast(f, subds = "PP")
+  
+  # Project PP onto the base grid (SST/depth grid)
+  pp_proj <- project(pp_raw, template, method = "bilinear")
+  
+  # Restrict to active cells (same as depth_base extent & NA pattern)
+  pp_proj <- mask(pp_proj, template)
+  
+  # Mask of non-NA PP values
+  non_na <- !is.na(pp_proj)
+  
+  # Replace NA with 0 so they don't affect the sum
+  pp_proj_na0 <- pp_proj
+  pp_proj_na0[is.na(pp_proj_na0)] <- 0
+  
+  # Accumulate sum of PP
+  sum_PP <- sum_PP + pp_proj_na0
+  
+  # Accumulate count of months with valid PP
+  # TRUE -> 1, FALSE -> 0, so summing works
+  count_PP <- count_PP + non_na
+}
+
+sum_PP
+count_PP
+```
+Compute mean PP between 1998 and 2024
+```{r}
+# Avoid division by zero / no-data cells
+mean_PP <- sum_PP / count_PP
+mean_PP[count_PP == 0] <- NA
+
+names(mean_PP) <- "PP_mean_mg_m2_d"
+
+plot(mean_PP, main = "Mean PP (1998–2024) [mgC m^-2 d^-1]")
+global(mean_PP, fun = range, na.rm = TRUE)
+
+
+```
+
+Convert to mgC/m³/day
+```{r}
+# Sanity
+global(depth_base, fun = range, na.rm = TRUE)
+
+# Volume-based PP: mgC m^-3 day^-1
+# PP_vol <- mean_PP / depth_base
+PP_vol <- mean_PP / 10
+
+# Where depth <= 0 or depth is NA, set PP to NA
+# PP_vol[is.na(depth_base) | depth_base <= 0] <- NA
+
+names(PP_vol) <- "PP_mean_mg_m3_d"
+
+# --- NEW: cap values at 3000 ---
+# PP_vol <- clamp(PP_vol, upper = 300)
+
+plot(PP_vol, main = "Mean PP (1998–2024) [mgC m^-3 d^-1]")
+global(PP_vol, fun = range, na.rm = TRUE)
+
+# Volume-based mean PP for the software
+writeRaster(
+  PP_vol,
+  filename  = file.path(out_dir, "PP_mean_1998_2024_mgC_m3_d.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(
+  PP_vol,
+  filename  = file.path(out_dir, "PP_mean_1998_2024_mgC_m3_d.asc"),
+  overwrite = TRUE
+)
+```
+Ecospace Base Relative Primary Production
+```{r}
+# Correct: get numeric mean
+mean_PP <- sum_PP / count_PP
+mean_PP[count_PP == 0] <- NA  # treat “no data” as NA
+names(mean_PP) <- "PP_mean_mg_m2_d"
+
+PP_vol <- mean_PP / 10
+names(PP_vol) <- "PP_mean_mg_m3_d"
+plot(PP_vol)
+
+pp_mean <- global(PP_vol, "mean", na.rm = TRUE)$mean
+RPP_mean <- PP_vol / pp_mean
+names(RPP_mean) <- "RPP_mean"
+
+RPP_mean_0 <- RPP_mean
+RPP_mean_0[is.na(RPP_mean_0)] <- 0
+
+plot(RPP_mean_0)
+# Check if values make sense:
+plot(RPP_mean > 1, main = "Cells with above-average PP")
+
+writeRaster(
+  RPP_mean_0,
+  filename = file.path(out_dir, "RelativePimProd_basegrid.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(
+  RPP_mean_0,
+  filename = file.path(out_dir, "RelativePimProd_base_mean.asc"),
+  overwrite = TRUE
+)
+```
+
+Anomaly of PP (Nutrients)
+```{r}
+library(terra)
+library(dplyr)
+library(stringr)
+
+# 1) Read anomaly CSV
+anom_raw <- read.csv("PP_anomaly.csv", stringsAsFactors = FALSE)
+
+# 2) Identify which rows are actual years vs months
+months_vec <- c(
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+)
+
+anom_years <- anom_raw %>%
+  filter(!Name %in% months_vec) %>%          # keep only year rows
+  mutate(
+    Year        = as.integer(Name),
+    anom_factor = PO4_y_copernicus_2        # multiplicative factor
+  ) %>%
+  arrange(Year)
+
+# Check range
+range(anom_years$Year)
+head(anom_years)
+
+# Factor for 1991
+f_1991 <- anom_years$anom_factor[anom_years$Year == 1991]
+
+if (length(f_1991) != 1 || is.na(f_1991)) {
+  stop("Could not find a unique anomaly for year 1991.")
+}
+
+anom_years <- anom_years %>%
+  mutate(rel_factor = anom_factor / f_1991)
+
+# Sanity: should be 1
+anom_years$rel_factor[anom_years$Year == 1991]
+
+# Otherwise, reload from file:
+RPP_base <- rast(file.path(out_dir, "RelativePimProd_base_mean.asc"))
+names(RPP_base) <- "RPP_base"
+
+# Optional quick check
+plot(RPP_base, main = "Baseline Relative PP (climatology)")
+global(RPP_base, "mean", na.rm = TRUE)
+```
+
+
+```{r}
+# ---- 1. Years to produce: FULL model horizon ----
+years_vec <- 1991:2150
+
+# Last year that has an anomaly in the CSV
+max_year_in_csv <- max(anom_years$Year, na.rm = TRUE)
+last_rel_factor <- anom_years$rel_factor[anom_years$Year == max_year_in_csv]
+
+if (length(last_rel_factor) != 1 || is.na(last_rel_factor)) {
+  stop("Could not determine a unique last_rel_factor from anomaly data.")
+}
+
+# ---- 2. Output dir ----
+out_rpp_dir <- file.path(out_dir, "RPP_relative_yearly")
+if (!dir.exists(out_rpp_dir)) dir.create(out_rpp_dir, recursive = TRUE)
+
+# ---- 3. Loop over all years 1991–2150 ----
+for (yr in years_vec) {
+  
+  if (yr %in% anom_years$Year) {
+    # Year covered by CSV: use its own rel_factor
+    f_rel <- anom_years$rel_factor[anom_years$Year == yr]
+  } else {
+    # Year beyond CSV range: reuse last available factor (e.g. 2025)
+    f_rel <- last_rel_factor
+  }
+  
+  # Safety check
+  if (length(f_rel) != 1 || is.na(f_rel)) {
+    warning("Year ", yr, ": rel_factor missing or ambiguous, skipping.")
+    next
+  }
+  
+  # Multiply baseline map by this year's factor
+  r_year <- RPP_base * f_rel
+  
+  # NA → 0 for Ecospace
+  r_year_0 <- r_year
+  r_year_0[is.na(r_year_0)] <- 0
+  names(r_year_0) <- paste0("RPP_rel_", yr)
+  
+  # Write as ASCII (and optional GeoTIFF)
+  out_asc <- file.path(out_rpp_dir, paste0("RPP_rel_", yr, ".asc"))
+  out_tif <- file.path(out_rpp_dir, paste0("RPP_rel_", yr, ".tif"))
+  
+  writeRaster(r_year_0, filename = out_asc, overwrite = TRUE)
+  writeRaster(r_year_0, filename = out_tif, overwrite = TRUE)
+  
+  cat("Written:", basename(out_asc), " (factor =", f_rel, ")\n")
+}
+```
+
+
+
+DISTANCE TO LAND
+```{r}
+# First build land mark
+# depth_base_0: >0 = sea, 0 = land/inactive
+land_mask <- depth_base_0
+
+# Sea cells (depth > 0) -> NA
+land_mask[land_mask > 0] <- NA
+
+# Land / inactive cells (0) -> 1
+land_mask[land_mask == 0] <- 1
+
+names(land_mask) <- "land"
+
+plot(land_mask, main = "Land mask (1 = land, NA = sea)")
+
+# Project land mask to a metric CRS (for accurate distances)
+land_mask_proj <- project(land_mask, "EPSG:3035", method = "near")
+
+crs(land_mask_proj)
+res(land_mask_proj)
+plot(land_mask_proj, main = "Land mask in EPSG:3035")
+
+# Distance to land
+# Distance from sea (NA) to nearest land cell (non-NA)
+dist_m_proj <- distance(land_mask_proj)
+
+names(dist_m_proj) <- "dist_m_to_coast"
+plot(dist_m_proj, main = "Distance to coast [m] (projected)")
+
+# Back to base grid (lon/lat + SBNS extent)
+dist_m <- project(dist_m_proj, depth_base, method = "bilinear")
+names(dist_m) <- "dist_m_to_coast"
+
+plot(dist_m, main = "Distance to coast [m] on base grid")
+
+# To km
+dist_km <- dist_m / 1000
+names(dist_km) <- "dist_km_to_coast"
+
+plot(dist_km, main = "Distance to coast [km] on base grid")
+global(dist_km, fun = range, na.rm = TRUE)
+
+# Version 1: NA on land/inactive, distance (km) on sea
+dist_km_sea <- dist_km
+dist_km_sea[depth_base_0 == 0] <- NA
+names(dist_km_sea) <- "dist_km_to_coast"
+
+plot(dist_km_sea, main = "Distance to coast [km] (sea cells only)")
+
+# Version 2 (for software): 0 on land/inactive, distance (km) on sea
+dist_km_0 <- dist_km
+dist_km_0[depth_base_0 == 0] <- 0
+names(dist_km_0) <- "dist_km_to_coast"
+
+plot(dist_km_0, main = "Distance to coast [km]; 0 = land/inactive")
+
+
+# Store data
+# GeoTIFF
+writeRaster(
+  dist_km_0,
+  filename  = file.path(out_dir, "DistCoast_SBNS_Basegrid_km.tif"),
+  overwrite = TRUE
+)
+
+# ESRI ASCII (if you want it as model input)
+writeRaster(
+  dist_km_0,
+  filename  = file.path(out_dir, "DistCoast_km.asc"),
+  overwrite = TRUE
+)
+```
+
+COASTAL - MARINE
+```{r}
+# 12 nautical miles in km
+nm_to_km    <- 1.852
+coastal_thr <- 12 * nm_to_km  # 22.224 km
+coastal_thr
+
+# If needed: rebuild dist_km with NA on land
+dist_km <- dist_km_0
+dist_km[depth_base_0 == 0] <- NA
+names(dist_km) <- "dist_km_to_coast"
+
+sea_cells <- depth_base_0 > 0   # TRUE on active sea cells
+
+template <- depth_base_0
+values(template) <- 0
+
+coastal_cells <- sea_cells & (dist_km <= coastal_thr)
+marine_cells  <- sea_cells & (dist_km >  coastal_thr)
+
+# Quick sanity check counts
+sum(coastal_cells, na.rm = TRUE)
+sum(marine_cells,  na.rm = TRUE)
+
+
+# SEABIRDS
+seabirds_cm <- template  # starts at 0 everywhere
+
+seabirds_cm[coastal_cells] <- 1
+seabirds_cm[marine_cells]  <- 0.75
+
+names(seabirds_cm) <- "coastal_marine_seabirds"
+
+plot(seabirds_cm, main = "Coastal–marine (seabirds)\n1 = coastal, 0.75 = marine, 0 = land")
+
+
+# CRANGON
+crangon_cm <- template  # 0 everywhere by default
+
+crangon_cm[coastal_cells] <- 1
+# marine_cells remain 0
+
+names(crangon_cm) <- "coastal_marine_crangon"
+
+plot(crangon_cm, main = "Coastal–marine (crangon)\n1 = coastal, 0 = marine/land")
+
+# MEIOFAUNA
+meiofauna_cm <- template  # 0 everywhere
+
+meiofauna_cm[coastal_cells] <- 1
+meiofauna_cm[marine_cells]  <- 0.5
+
+names(meiofauna_cm) <- "coastal_marine_meiofauna"
+
+plot(meiofauna_cm, main = "Coastal–marine (meiofauna)\n1 = coastal, 0.5 = marine, 0 = land")
+
+# Seabirds
+writeRaster(
+  seabirds_cm,
+  filename  = file.path(out_dir, "CoastalMarine_Seabirds.tif"),
+  overwrite = TRUE
+)
+writeRaster(
+  seabirds_cm,
+  filename  = file.path(out_dir, "CoastalMarine_Seabirds.asc"),
+  overwrite = TRUE
+)
+
+# Crangon
+writeRaster(
+  crangon_cm,
+  filename  = file.path(out_dir, "CoastalMarine_Crangon.tif"),
+  overwrite = TRUE
+)
+writeRaster(
+  crangon_cm,
+  filename  = file.path(out_dir, "CoastalMarine_Crangon.asc"),
+  overwrite = TRUE
+)
+
+# Meiofauna
+writeRaster(
+  meiofauna_cm,
+  filename  = file.path(out_dir, "CoastalMarine_Meiofauna.tif"),
+  overwrite = TRUE
+)
+writeRaster(
+  meiofauna_cm,
+  filename  = file.path(out_dir, "CoastalMarine_Meiofauna.asc"),
+  overwrite = TRUE
+)
+```
+
+
+Habitats
+(make sure all are 1, this will make OWF ingestion later on much easier)
+```{r}
+path_folk <- file.path(
+  base_dir,
+  "SedimentHabitats",
+  "seabed_substrate_250k.shp"
+)
+
+folk <- vect(path_folk)
+plot(folk)
+folk
+crs(folk)
+names(folk)
+
+# reproject and clip
+# Make sure CRS matches the base grid (depth/SST grid)
+if (crs(folk) != crs(depth_base_0)) {
+  folk <- project(folk, depth_base_0)
+}
+
+# Optional: crop to SBNS or base grid extent to speed things up
+folk_sbns <- crop(folk, depth_base_0)
+folk_sbns
+plot(folk_sbns)
+```
+grid cell of polygons with IDs
+```{r}
+template  <- depth_base_0          # base grid
+sea_mask  <- template > 0          # TRUE on active sea cells
+n_cells   <- ncell(template)
+n_cells
+# Create one polygon per raster cell (in current CRS)
+grid <- as.polygons(template, values = FALSE, dissolve = FALSE)
+grid$cell_id <- 1:nrow(grid)      # 1 : n_cells
+nrow(grid)
+
+path_folk <- file.path(
+  base_dir,
+  "SedimentHabitats",
+  "seabed_substrate_250k.shp"
+)
+
+folk <- vect(path_folk)
+
+# Reproject Folk to base grid CRS if needed
+if (crs(folk) != crs(template)) {
+  folk <- project(folk, template)
+}
+
+# Clip Folk to SBNS/base extent
+folk_sbns <- crop(folk, template)
+
+library(terra)
+library(dplyr)
+
+folk_field <- "folk_5cl"
+
+# Intersections: each row is (cell polygon ∩ sediment polygon)
+iv <- intersect(grid, folk_sbns)
+iv
+nrow(iv)       # this SHOULD now be >> 60, likely several thousand
+
+# Compute overlap area per intersection piece in m² (geodesic)
+iv$area_m2 <- expanse(iv, unit = "m")
+
+# Extract attributes to a data.frame
+iv_df <- as.data.frame(iv[, c("cell_id", folk_field, "area_m2")])
+names(iv_df)[2] <- "folk_5cl"
+head(iv_df)
+
+dom_tbl <- iv_df %>%
+  group_by(cell_id, folk_5cl) %>%
+  summarise(area_m2 = sum(area_m2), .groups = "drop") %>%
+  group_by(cell_id) %>%
+  slice_max(area_m2, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+dom_tbl
+nrow(dom_tbl)  # number of cells that intersect at least one sediment polygon
+folk_vals <- c(
+  "1. Mud to muddy Sand",
+  "2. Sand",
+  "3. Coarse-grained sediment",
+  "4. Mixed sediment",
+  "5. Rock & boulders"
+)
+
+# Map label -> numeric ID 1..5
+class_to_id <- setNames(seq_along(folk_vals), folk_vals)
+
+# Vector of habitat IDs per cell (NA initial)
+hab_id_vec <- rep(NA_integer_, n_cells)
+
+# Add numeric IDs to dom_tbl
+dom_tbl$hab_id <- class_to_id[dom_tbl$folk_5cl]
+
+# Assign IDs by cell_id
+hab_id_vec[dom_tbl$cell_id] <- dom_tbl$hab_id
+
+# Convert to raster aligned with template
+hab_id <- template
+values(hab_id) <- hab_id_vec
+
+# Keep only sea cells
+hab_id[!sea_mask] <- NA
+
+names(hab_id) <- "Folk5_id_dominant"
+
+plot(hab_id, main = "Dominant Folk-5 ID (1–5) per sea cell")
+
+```
+
+Fill cells without habitat (nearest habitat)
+```{r}
+# Sea cells with no class assigned yet
+na_sea <- is.na(hab_id) & sea_mask
+sum(values(na_sea), na.rm = TRUE)  # how many sea cells without habitat?
+
+# Distance to each class
+dist_layers <- list()
+
+for (i in seq_along(folk_vals)) {
+  cat("Computing distance to class ID", i, ":", folk_vals[i], "\n")
+  
+  is_class <- hab_id == i
+  dist_i   <- distance(is_class)    # distance to nearest cell of this class
+  
+  dist_layers[[i]] <- dist_i
+}
+
+dist_stack <- rast(dist_layers)
+names(dist_stack) <- paste0("dist_to_id_", seq_along(folk_vals))
+
+# For each cell, ID of the closest class
+nearest_id <- which.min(dist_stack)
+
+# Fill NA sea cells with nearest class
+hab_filled <- hab_id
+hab_filled[na_sea] <- nearest_id[na_sea]
+
+# Land/inactive remain NA
+hab_filled[!sea_mask] <- NA
+
+names(hab_filled) <- "Folk5_id_final"
+
+plot(hab_filled, main = "Final Folk-5 ID (dominant + nearest fill)")
+
+```
+Build 5 binary habitat rasters
+```{r}
+folk_labels <- c(
+  "1. Mud to muddy Sand"       = "Mud_MuddySand",
+  "2. Sand"                    = "Sand",
+  "3. Coarse-grained sediment" = "CoarseSed",
+  "4. Mixed sediment"          = "MixedSed",
+  "5. Rock & boulders"         = "RockBoulders"
+)
+
+hab_rasters <- list()
+
+for (i in seq_along(folk_vals)) {
+  cl    <- folk_vals[i]
+  short <- folk_labels[[cl]]
+  
+  r_cl <- template
+  values(r_cl) <- 0
+  
+  # 1 where this class is the final ID AND sea
+  r_cl[sea_mask & (hab_filled == i)] <- 1
+  
+  names(r_cl) <- paste0("Folk5_", short)
+  hab_rasters[[short]] <- r_cl
+}
+
+# check if they sum to 1
+hab_stack <- rast(hab_rasters)
+hab_sum   <- sum(hab_stack)
+names(hab_sum) <- "Folk5_sum"
+
+plot(hab_sum, main = "Sum of Folk-5 binary layers")
+
+sum_values <- values(hab_sum)
+sea_idx    <- which(values(sea_mask))
+
+table(sum_values[sea_idx], useNA = "ifany")
+
+# Quick plot to check rasters
+par(mfrow = c(2, 3))
+
+for (nm in names(hab_rasters)) {
+  plot(hab_rasters[[nm]], 
+       main = nm, 
+       col = c("white", "dodgerblue"))
+}
+```
+
+Export to 5 habitat rasters
+```{r}
+for (short in names(hab_rasters)) {
+  r_cl <- hab_rasters[[short]]
+  fname_stub <- paste0("Folk5_", short)
+  
+  writeRaster(
+    r_cl,
+    filename  = file.path(out_dir, paste0(fname_stub, ".tif")),
+    overwrite = TRUE
+  )
+  
+  writeRaster(
+    r_cl,
+    filename  = file.path(out_dir, paste0(fname_stub, ".asc")),
+    overwrite = TRUE
+  )
+}
+```
+--------------------------------------------------------------------------
+Spatial Temporal Data (Habitat + OWFs)
+Need maps from 1991 to 2150
+first make OWF presence or not
+Then make 2 times 5 habitat layers:
+1) Habitat-name-(without)-OWF indicating for each habitat its presence (will be 1 where habitat is present, 0 where absent, between 0 and 1 where overlapping with OWF area)
+2) For each habitat also make Habitat_OWF (%OWF in cell in that habitat) Will be 0 where OWFs are not present, between 0 and 1 where present in that habitat
+
+If data available for owf:
+area
+N turbines
+--> calculate substrate proportion to cell
+
+If no data available for owf
+--> use avergage  turbine density (calculated from owfs for which data is available)
+--> estimate substrate proportion to cell
+
+Parameter initialisatoin
+```{r}
+# --- Parameters from ter Hofstede et al. (2023) + Püts-style 1 m lateral
+# Scour / armour rock area per turbine [m²]
+A_scour <- 530.2      
+# Representative average monopile diameter [m]
+D_mp <- 7             
+# Lateral surface of 1 m monopile [m²]
+A_lat_1m <- pi * D_mp   # ≈ 21.99
+# Total hard-substrate area per turbine [m²]
+A_hard_turb <- A_scour + A_lat_1m  # ≈ 552.2 m²
+A_hard_turb
+```
+Farm-specific owf density (rho)
+```{r}
+library(terra)
+library(dplyr)
+
+# Base grid
+template <- depth_base_0
+sea_mask <- template > 0
+
+# Path to OWF polygons
+path_owf <- file.path(
+  base_dir,
+  "OffshoreWindFarms",
+  "EMODnet_HA_Energy_WindFarms_pg_20250825.shp"
+)
+
+# Load OWF polygons
+owf <- vect(path_owf)
+
+# Project to base grid CRS
+if (crs(owf) != crs(template)) {
+  owf <- project(owf, template)
+}
+
+# Restrict to SBNS / model domain
+owf_sbns <- crop(owf, template)
+
+# Inspect fields once (just to see N_TURBINES etc.)
+names(owf_sbns)
+
+# Ensure turbine count column is numeric; adjust "N_TURBINES" if your field is named differently
+owf_sbns$N_TURBINES <- as.numeric(owf_sbns$N_TURBINES)
+
+# Compute geometric farm area [m²] for each OWF polygon
+owf_sbns$A_farm_m2 <- expanse(owf_sbns, unit = "m")
+
+# Compute global mean turbindensity
+valid <- !is.na(owf_sbns$N_TURBINES) & owf_sbns$N_TURBINES > 0 &
+         !is.na(owf_sbns$A_farm_m2)  & owf_sbns$A_farm_m2  > 0
+
+sum(valid)  # how many farms have proper turbine counts?
+
+# Total turbines and total area for valid polygons
+tot_turbines <- sum(owf_sbns$N_TURBINES[valid])
+tot_area_m2  <- sum(owf_sbns$A_farm_m2[valid])
+
+# Global mean turbine density from *your* EMODnet data [turbines per m²]
+dens_mean_per_m2 <- tot_turbines / tot_area_m2
+
+# In more intuitive units: turbines per km²
+dens_mean_per_km2 <- dens_mean_per_m2 * 1e6
+
+dens_mean_per_m2
+dens_mean_per_km2
+
+```
+calculate farm-specific hard substrate density
+```{r}
+# Initialise rho with NA
+rho <- rep(NA_real_, nrow(owf_sbns))
+
+# 1) Farms with explicit N_TURBINES: farm-specific rho
+rho[valid] <- (owf_sbns$N_TURBINES[valid] * A_hard_turb) /
+              owf_sbns$A_farm_m2[valid]
+
+# 2) Farms without N_TURBINES: fallback using EMODnet-derived mean density
+fallback_idx <- !valid & !is.na(owf_sbns$A_farm_m2) & owf_sbns$A_farm_m2 > 0
+
+rho_fallback <- dens_mean_per_m2 * A_hard_turb  # m²/m² (dimensionless)
+rho[fallback_idx] <- rho_fallback
+
+# Just in case we still have NA (strange geometries), set to 0
+rho[is.na(rho)] <- 0
+
+owf_sbns$rho <- rho
+
+summary(owf_sbns$rho)
+
+```
+
+Cell-fraction that is OWF hard substrate:
+```{r}
+# Build grid polygons from template
+grid <- as.polygons(template, values = FALSE, dissolve = FALSE)
+grid$cell_id <- 1:nrow(grid)
+
+# Cell area [m²]
+A_cell <- expanse(grid[1, ], unit = "m")
+
+# Intersect grid with OWFs
+iv <- intersect(grid, owf_sbns)
+
+iv$A_int_m2 <- expanse(iv, unit = "m")
+
+iv_df <- as.data.frame(iv[, c("cell_id", "rho", "A_int_m2")])
+
+hard_by_cell <- iv_df %>%
+  mutate(f_piece = (A_int_m2 / A_cell) * rho) %>%
+  group_by(cell_id) %>%
+  summarise(f_hard = sum(f_piece), .groups = "drop")
+
+hard_by_cell$f_hard <- pmin(hard_by_cell$f_hard, 1)
+
+f_hard_vec <- rep(0, ncell(template))
+f_hard_vec[hard_by_cell$cell_id] <- hard_by_cell$f_hard
+
+f_hard_r <- template
+values(f_hard_r) <- f_hard_vec
+names(f_hard_r) <- "OWF_hard_frac"
+
+# land/inactive as 0
+f_hard_r[!sea_mask] <- 0
+
+plot(f_hard_r, main = "Fraction of cell that is OWF hard substrate")
+global(f_hard_r, fun = range, na.rm = TRUE)
+
+```
+
+OWF presence raster (MPA layer in Ecospace)
+```{r}
+owf_presence <- rasterize(
+  owf_sbns,
+  template,
+  field      = 1,
+  background = 0,
+  touches    = TRUE
+)
+owf_presence[!sea_mask] <- 0
+names(owf_presence) <- "OWF_presence"
+
+plot(owf_presence)
+
+
+# Store to .asc file for Ecospace input of MPA
+library(terra)
+
+years_all <- 1991:2150
+
+# Output dir for MPA rasters
+out_mpa_dir <- file.path(base_dir, "Processed", "OWF_MPA")
+dir.create(out_mpa_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (y in years_all) {
+  if (y < 2025) {
+    # No MPA yet
+    r <- template
+    values(r) <- 0
+  } else {
+    # MPA = OWF presence
+    r <- owf_presence
+  }
+  
+  # Ensure land/inactive are 0
+  r[!sea_mask] <- 0
+  names(r) <- "OWF_MPA"
+  
+  # Save as ASCII for Ecospace
+  writeRaster(
+    r,
+    filename  = file.path(out_mpa_dir, paste0("OWF_MPA_", y, ".asc")),
+    overwrite = TRUE
+  )
+}
+```
+
+Habitat_noOWF and Habitat_OWF per folk5 class
+```{r}
+out_hab_dir <- file.path(base_dir, "Processed", "Habitats_OWF")
+dir.create(out_hab_dir, recursive = TRUE, showWarnings = FALSE)
+
+hab_owf_rasters <- list()
+
+for (nm in names(hab_rasters)) {
+  H <- hab_rasters[[nm]]   # 0/1 raster for this Folk5 class
+  
+  # Remaining soft habitat
+  H_noOWF <- H * (1 - f_hard_r)
+  names(H_noOWF) <- paste0("Folk5_", nm, "_noOWF")
+  
+  # OWF hard substrate
+  H_OWF <- H * f_hard_r
+  names(H_OWF) <- paste0("Folk5_", nm, "_OWF")
+  
+  hab_owf_rasters[[paste0(nm, "_noOWF")]] <- H_noOWF
+  hab_owf_rasters[[paste0(nm, "_OWF")]]   <- H_OWF
+  
+  writeRaster(
+    H_noOWF,
+    filename  = file.path(out_hab_dir, paste0("Folk5_", nm, "_noOWF.asc")),
+    overwrite = TRUE
+  )
+  writeRaster(
+    H_OWF,
+    filename  = file.path(out_hab_dir, paste0("Folk5_", nm, "_OWF.asc")),
+    overwrite = TRUE
+  )
+}
+
+```
+Store Habitat data 1991-2150
+```{r}
+years_all <- 1991:2150
+
+# Output directory for temporal habitat layers
+out_hab_time_dir <- file.path(base_dir, "Processed", "Habitats_OWF_temporal")
+dir.create(out_hab_time_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (nm in names(hab_rasters)) {
+  # Base (clean) habitat raster (0/1)
+  H_base <- hab_rasters[[nm]]
+  
+  # OWF-adjusted rasters
+  H_noOWF_OWF <- hab_owf_rasters[[paste0(nm, "_noOWF")]]  # Folk5_<nm>_noOWF
+  H_OWF       <- hab_owf_rasters[[paste0(nm, "_OWF")]]    # Folk5_<nm>_OWF
+  
+  # Sanity check: alignment
+  stopifnot(
+    all.equal(ext(H_base), ext(template)),
+    nrow(H_base) == nrow(template),
+    ncol(H_base) == ncol(template)
+  )
+  
+  for (y in years_all) {
+    if (y < 2025) {
+      # No OWFs yet: only base habitat, no OWF hard substrate
+      r_noOWF <- H_base
+      r_OWF   <- template
+      values(r_OWF) <- 0
+    } else {
+      # OWFs active: use OWF-adjusted layers
+      r_noOWF <- H_noOWF_OWF
+      r_OWF   <- H_OWF
+    }
+    
+    # Enforce 0 on land/inactive (Ecospace convention)
+    r_noOWF[!sea_mask] <- 0
+    r_OWF[!sea_mask]   <- 0
+    
+    names(r_noOWF) <- paste0("Folk5_", nm, "_noOWF")
+    names(r_OWF)   <- paste0("Folk5_", nm, "_OWF")
+    
+    # File names: include habitat + year
+    fn_noOWF <- file.path(
+      out_hab_time_dir,
+      paste0("Folk5_", nm, "_noOWF_", y, ".asc")
+    )
+    fn_OWF <- file.path(
+      out_hab_time_dir,
+      paste0("Folk5_", nm, "_OWF_", y, ".asc")
+    )
+    
+    writeRaster(r_noOWF, filename = fn_noOWF, overwrite = TRUE)
+    writeRaster(r_OWF,   filename = fn_OWF,   overwrite = TRUE)
+  }
+}
+
+```
+
+```{r}
+hab <- "Sand"                    # change to: Mud, Sand, Mixed, Coarse, Rock
+years_to_plot <- c(1999, 2030)
+
+rasters_to_plot <- list()
+
+for (y in years_to_plot) {
+  f_no   <- file.path(out_hab_time_dir, paste0("Folk5_", hab, "_noOWF_", y, ".asc"))
+  f_owf  <- file.path(out_hab_time_dir, paste0("Folk5_", hab, "_OWF_", y, ".asc"))
+  
+  r_no  <- rast(f_no)
+  r_owf <- rast(f_owf)
+  
+  rasters_to_plot[[paste0("noOWF_", y)]] <- r_no
+  rasters_to_plot[[paste0("OWF_",  y)]] <- r_owf
+}
+
+# Plot
+par(mfrow = c(2, length(years_to_plot)))
+
+for (nm in names(rasters_to_plot)) {
+  plot(rasters_to_plot[[nm]], main = nm)
+}
+
+```
+
+
+Mean turbine density from empdnet data: 1 turbine per km²
+```{r}
+# Offshore wind farm polygons (Operational and planned)
+("C:\Users\dlorr\OneDrive - UGent\Documents\PhD\EwE_OWF\Spatial data\OffshoreWindFarms\EMODnet_HA_Energy_WindFarms_pg_20250825.shp")
+# Mean hard-substrate density per OWF area (dimensionless)
+
+rho_mean <- A_hard_turb / (dens_km2 * 1e6)  # m² / m²
+
+
+A_hard_turb
+rho_mean
+```
+
+
+
+Spatial Temporal Data (Temperature and Salinity)
+```{r}
+library(terra)
+library(dplyr)
+
+# Base data folders
+base_dir   <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data"
+path_temp  <- file.path(base_dir, "Temperature")
+path_sal   <- file.path(base_dir, "Salinity")
+
+# Root output folder
+out_root <- file.path(base_dir, "Processed")
+if (!dir.exists(out_root)) dir.create(out_root)
+
+# Variable- and scenario-specific output dirs
+out_temp_baseline <- file.path(out_root, "Temperature", "Baseline")
+out_sal_baseline  <- file.path(out_root, "Salinity", "Baseline")
+
+dir.create(out_temp_baseline, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_sal_baseline,  recursive = TRUE, showWarnings = FALSE)
+
+# Base grid
+template <- depth_base_0
+sea_mask <- template > 0
+```
+Helper function to fetch year and month
+```{r}
+get_year_month_cmems <- function(f) {
+  b <- basename(f)
+  m <- regexpr("[0-9]{8}", b)
+  date_str <- substr(b, m, m + 7)
+  year  <- as.integer(substr(date_str, 1, 4))
+  month <- as.integer(substr(date_str, 5, 6))
+  list(year = year, month = month)
+}
+```
+
+Helper function to extract means of 1993-2024 data (available data)
+```{r}
+compute_annual_means <- function(path_nc, subds_name, template, sea_mask) {
+  files <- list.files(path_nc, pattern = "\\.nc$", full.names = TRUE)
+  if (length(files) == 0) stop("No NetCDF files found in ", path_nc)
+  
+  # Parse year/month
+  ym <- lapply(files, get_year_month_cmems)
+  years  <- sapply(ym, `[[`, "year")
+  months <- sapply(ym, `[[`, "month")
+  
+  df <- data.frame(file = files, year = years, month = months)
+  
+  # Keep years up to and including 2024
+  df <- df[df$year <= 2024, ]
+  if (nrow(df) == 0) stop("No files with year <= 2024 in ", path_nc)
+  
+  annual_list <- list()
+  yrs <- sort(unique(df$year))
+  
+  for (y in yrs) {
+    cat("Processing year:", y, "\n")
+    df_y <- df[df$year == y, ]
+    
+    # Init accumulators on template
+    sum_r   <- template; values(sum_r)   <- 0
+    count_r <- template; values(count_r) <- 0
+    
+    for (f in df_y$file) {
+      cat("  -", basename(f), "\n")
+      
+      # Read the variable
+      r_raw <- try({
+        rast(f, subds = subds_name)
+      }, silent = TRUE)
+      
+      if (inherits(r_raw, "try-error")) {
+        # Fallback: take first layer if subdataset name fails
+        r_raw <- rast(f)
+      }
+      
+      # ⚠️ Ensure we only work with ONE layer (e.g. surface / first level)
+      if (nlyr(r_raw) > 1) {
+        r_raw <- r_raw[[1]]
+      }
+      
+      # Project onto base grid (still single-layer)
+      r_proj <- project(r_raw, template, method = "bilinear")
+      
+      # Just in case project() returns multiple layers (shouldn't, but be safe)
+      if (nlyr(r_proj) > 1) {
+        r_proj <- r_proj[[1]]
+      }
+      
+      # Mask to sea cells only
+      r_proj[!sea_mask] <- NA
+      
+      # NA handling
+      non_na <- !is.na(r_proj)
+      r_proj_na0 <- r_proj
+      r_proj_na0[is.na(r_proj_na0)] <- 0
+      
+      # Accumulate
+      sum_r   <- sum_r   + r_proj_na0
+      count_r <- count_r + non_na
+    }
+    
+    mean_r <- sum_r / count_r
+    mean_r[count_r == 0] <- NA
+    
+    # Now mean_r is guaranteed to be single-layer
+    stopifnot(nlyr(mean_r) == 1)
+    
+    names(mean_r) <- paste0("year_", y)
+    annual_list[[as.character(y)]] <- mean_r
+  }
+  
+  annual_list
+}
+```
+
+For monthly data:
+```{r}
+compute_monthly_rasters <- function(path_nc, subds_name, template, sea_mask) {
+  files <- list.files(path_nc, pattern = "\\.nc$", full.names = TRUE)
+  if (length(files) == 0) stop("No NetCDF files found in ", path_nc)
+  
+  # Parse year/month
+  ym <- lapply(files, get_year_month_cmems)
+  years  <- sapply(ym, `[[`, "year")
+  months <- sapply(ym, `[[`, "month")
+  
+  df <- data.frame(file = files, year = years, month = months)
+  
+  # Only up to and including 2024
+  df <- df[df$year <= 2024, ]
+  if (nrow(df) == 0) stop("No files with year <= 2024 in ", path_nc)
+  
+  # Sort by time (year, month)
+  df <- df[order(df$year, df$month), ]
+  
+  monthly_list <- vector("list", nrow(df))
+  names(monthly_list) <- character(nrow(df))
+  
+  for (i in seq_len(nrow(df))) {
+    f <- df$file[i]
+    y <- df$year[i]
+    m <- df$month[i]
+    
+    cat("Monthly raster:", y, sprintf("%02d", m), "-", basename(f), "\n")
+    
+    r_raw <- try({
+      rast(f, subds = subds_name)
+    }, silent = TRUE)
+    
+    if (inherits(r_raw, "try-error")) {
+      r_raw <- rast(f)
+    }
+    if (nlyr(r_raw) > 1) {
+      r_raw <- r_raw[[1]]
+    }
+    
+    r_proj <- project(r_raw, template, method = "bilinear")
+    if (nlyr(r_proj) > 1) {
+      r_proj <- r_proj[[1]]
+    }
+    
+    # Mask land
+    r_proj[!sea_mask] <- NA
+    
+    nm <- sprintf("Y%04d_M%02d", y, m)
+    names(r_proj) <- nm
+    monthly_list[[i]] <- r_proj
+    names(monthly_list)[i] <- nm
+  }
+  
+  monthly_stack <- rast(monthly_list)
+  monthly_stack
+}
+```
+
+
+Check variable names
+```{r}
+# Temperature
+ex_temp <- list.files(path_temp, pattern = "\\.nc$", full.names = TRUE)[1]
+sds(rast(ex_temp))
+
+# Salinity
+ex_sal <- list.files(path_sal, pattern = "\\.nc$", full.names = TRUE)[1]
+sds(rast(ex_sal))
+```
+
+Annual means for SST and SSS
+```{r}
+# Adjust these after checking sds()
+var_temp <- "thetao"   # or the actual temp variable name
+var_sal  <- "so"       # or the actual salinity variable name
+
+# Temperature annual means
+temp_annual <- compute_annual_means(
+  path_nc    = path_temp,
+  subds_name = var_temp,
+  template   = template,
+  sea_mask   = sea_mask
+)
+
+# Salinity annual means
+sal_annual <- compute_annual_means(
+  path_nc    = path_sal,
+  subds_name = var_sal,
+  template   = template,
+  sea_mask   = sea_mask
+)
+
+# Quick checks
+length(temp_annual); names(temp_annual)
+length(sal_annual);  names(sal_annual)
+
+nlyr(temp_annual[[1]])         # should be 1
+plot(temp_annual[[1]])
+plot(temp_annual[[15]])
+plot(temp_annual[[32]])
+nlyr(sal_annual[[1]])         # should be 1
+plot(sal_annual[[1]])
+plot(sal_annual[[15]])
+plot(sal_annual[[32]])
+
+plot(temp_annual[["1993"]], main = "Temp annual mean 1993")
+plot(sal_annual[["1993"]],  main = "Sal annual mean 1993")
+```
+For monthly data
+```{r}
+# Monthly rasters 1993–2024 (baseline dataset)
+temp_monthly_raw <- compute_monthly_rasters(
+  path_nc    = path_temp,
+  subds_name = var_temp,
+  template   = template,
+  sea_mask   = sea_mask
+)
+
+plot(temp_monthly_raw[[1]])
+plot(temp_monthly_raw[[5]])
+plot(temp_monthly_raw[[12]])
+
+sal_monthly_raw <- compute_monthly_rasters(
+  path_nc    = path_sal,
+  subds_name = var_sal,
+  template   = template,
+  sea_mask   = sea_mask
+)
+
+# temp_monthly_raw
+# sal_monthly_raw
+```
+
+Generate Baseline scenario [YEARLY]:
+Baseline rule (per variable):
+1991–1992 → use 1993
+1993–2024 → use that year’s own raster
+2025–2150 → use 2024
+```{r}
+years_all <- 1991:2150
+
+## ---- Temperature baseline stack ----
+temp_baseline_list <- vector("list", length(years_all))
+names(temp_baseline_list) <- years_all
+
+for (y in years_all) {
+  if (y <= 1992) {
+    src_year <- 1993
+  } else if (y <= 2024) {
+    src_year <- y
+  } else {
+    src_year <- 2024
+  }
+  
+  src_key <- as.character(src_year)
+  temp_baseline_list[[as.character(y)]] <- temp_annual[[src_key]]
+}
+
+temp_baseline_stack <- rast(temp_baseline_list)
+names(temp_baseline_stack) <- paste0("Temp_", years_all)
+temp_baseline_stack
+
+
+## ---- Salinity baseline stack ----
+sal_baseline_list <- vector("list", length(years_all))
+names(sal_baseline_list) <- years_all
+
+for (y in years_all) {
+  if (y <= 1992) {
+    src_year <- 1993
+  } else if (y <= 2024) {
+    src_year <- y
+  } else {
+    src_year <- 2024
+  }
+  
+  src_key <- as.character(src_year)
+  sal_baseline_list[[as.character(y)]] <- sal_annual[[src_key]]
+}
+
+sal_baseline_stack <- rast(sal_baseline_list)
+names(sal_baseline_stack) <- paste0("Sal_", years_all)
+sal_baseline_stack
+
+
+# saveRDS(temp_baseline_stack,
+#         file = file.path(out_temp_baseline, "Temp_Baseline_1991_2150.rds"))
+# 
+# saveRDS(sal_baseline_stack,
+#         file = file.path(out_sal_baseline, "Sal_Baseline_1991_2150.rds"))
+```
+
+Save .asc files per variable [YEARLY]
+```{r}
+# Temperature
+for (i in seq_along(years_all)) {
+  y <- years_all[i]
+  r <- temp_baseline_stack[[i]]
+  
+  r0 <- r
+  r0[!sea_mask] <- 0   # 0 on land / inactive cells
+  
+  writeRaster(
+    r0,
+    filename  = file.path(out_temp_baseline, paste0("Temp_Baseline_", y, ".asc")),
+    overwrite = TRUE
+  )
+}
+
+# Salinity
+for (i in seq_along(years_all)) {
+  y <- years_all[i]
+  r <- sal_baseline_stack[[i]]
+  
+  r0 <- r
+  r0[!sea_mask] <- 0   # 0 on land / inactive cells
+  
+  writeRaster(
+    r0,
+    filename  = file.path(out_sal_baseline, paste0("Sal_Baseline_", y, ".asc")),
+    overwrite = TRUE
+  )
+}
+
+```
+
+Generate Baseline scenario [MONTLY]:
+Baseline rule (per variable):
+1991–1992 → use 1993
+1993–2024 → use that year’s own raster
+2025–2150 → use 2024
+```{r}
+years_all  <- 1991:2150
+months_all <- 1:12
+
+## ---- Temperature baseline monthly stack ----
+temp_baseline_monthly_list <- list()
+
+for (y in years_all) {
+  if (y <= 1992) {
+    src_year <- 1993
+  } else if (y <= 2024) {
+    src_year <- y
+  } else {
+    src_year <- 2024
+  }
+  
+  for (m in months_all) {
+    src_name <- sprintf("Y%04d_M%02d", src_year, m)
+    if (!src_name %in% names(temp_monthly_raw)) {
+      stop("Missing monthly source:", src_name)
+    }
+    
+    r <- temp_monthly_raw[[src_name]]
+    out_name <- sprintf("Temp_%d_%02d", y, m)
+    
+    temp_baseline_monthly_list[[out_name]] <- r
+  }
+}
+
+temp_baseline_monthly_stack <- rast(temp_baseline_monthly_list)
+temp_baseline_monthly_stack
+# layer names already like "Temp_1991_01", "Temp_1991_02", ...
+
+## ---- Salinity baseline monthly stack ----
+sal_baseline_monthly_list <- list()
+
+for (y in years_all) {
+  if (y <= 1992) {
+    src_year <- 1993
+  } else if (y <= 2024) {
+    src_year <- y
+  } else {
+    src_year <- 2024
+  }
+  
+  for (m in months_all) {
+    src_name <- sprintf("Y%04d_M%02d", src_year, m)
+    if (!src_name %in% names(sal_monthly_raw)) {
+      stop("Missing monthly source:", src_name)
+    }
+    
+    r <- sal_monthly_raw[[src_name]]
+    out_name <- sprintf("Sal_%d_%02d", y, m)
+    
+    sal_baseline_monthly_list[[out_name]] <- r
+  }
+}
+
+sal_baseline_monthly_stack <- rast(sal_baseline_monthly_list)
+sal_baseline_monthly_stack
+```
+Save .asc files per variable [MONTLY]
+```{r}
+# Temperature monthly baseline ASCII
+for (y in years_all) {
+  for (m in months_all) {
+    lyr_name <- sprintf("Temp_%d_%02d", y, m)
+    r <- temp_baseline_monthly_stack[[lyr_name]]
+    
+    r0 <- r
+    r0[!sea_mask] <- 0  # 0 on land / inactive
+    
+    fn <- file.path(
+      out_temp_baseline,
+      sprintf("Temp_Baseline_%d_%02d.asc", y, m)
+    )
+    
+    writeRaster(r0, filename = fn, overwrite = TRUE)
+  }
+}
+
+# Salinity monthly baseline ASCII
+for (y in years_all) {
+  for (m in months_all) {
+    lyr_name <- sprintf("Sal_%d_%02d", y, m)
+    r <- sal_baseline_monthly_stack[[lyr_name]]
+    
+    r0 <- r
+    r0[!sea_mask] <- 0
+    
+    fn <- file.path(
+      out_sal_baseline,
+      sprintf("Sal_Baseline_%d_%02d.asc", y, m)
+    )
+    
+    writeRaster(r0, filename = fn, overwrite = TRUE)
+  }
+}
+```
+
+
+Generate Climate change scenario
+```{r}
+# Root processed folder from before
+out_root <- file.path(base_dir, "Processed")
+
+# Climate change scenario (SSP3-7.0) output dirs
+out_temp_cc <- file.path(out_root, "Temperature", "ClimateChange_SSP3-7.0")
+out_sal_cc  <- file.path(out_root, "Salinity",   "ClimateChange_SSP3-7.0")
+
+dir.create(out_temp_cc, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_sal_cc,  recursive = TRUE, showWarnings = FALSE)
+
+
+path_sst_csv <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/R-scripts/Climate_projections_SSP3-7.0/SST_SSP3-7.0_monthly_1991_2099.csv"
+
+path_sss_csv <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/R-scripts/Climate_projections_SSP3-7.0/SSS_SSP3-7.0_monthly_1991_2099.csv"
+
+```
+
+SST and SSS annual means
+```{r}
+library(dplyr)
+library(readr)
+
+# Helper: compute annual means from monthly CSV
+compute_annual_from_csv <- function(path_csv, value_col = "value") {
+  df <- read_csv(path_csv, show_col_types = FALSE)
+  # Ensure column names exist: adjust if your file uses other names
+  
+  df_annual <- df %>%
+    group_by(year) %>%
+    summarise(
+      val = mean(.data[[value_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  df_annual
+}
+
+# Temperature (SST) annual means 1991–2099
+sst_annual <- compute_annual_from_csv(path_sst_csv, value_col = "value")
+write.csv(sst_annual, "SST_annual_1991-2100.csv")
+# Salinity (SSS) annual means 1991–2099
+sss_annual <- compute_annual_from_csv(path_sss_csv, value_col = "value")
+write.csv(sss_annual, "SSS_annual_1991-2100.csv")
+```
+
+Calculate anomalies from 2024 onwards
+```{r}
+ref_year <- 2024
+
+# Temperature anomalies
+sst_ref <- sst_annual$val[sst_annual$year == ref_year]
+sst_annual <- sst_annual %>%
+  mutate(anom_ref24 = val - sst_ref)
+
+# Salinity anomalies
+sss_ref <- sss_annual$val[sss_annual$year == ref_year]
+sss_annual <- sss_annual %>%
+  mutate(anom_ref24 = val - sss_ref)
+
+# Make named vectors: year -> anomaly
+anom_sst <- setNames(sst_annual$anom_ref24, sst_annual$year)
+anom_sss <- setNames(sss_annual$anom_ref24, sss_annual$year)
+```
+
+Build cull CC rasters (1991-2024 + 2025-2150)
+
+1991–2024: CC scenario = baseline (no anomaly)
+2025–2099: CC scenario = 2024 baseline grid + annual anomaly(y) 
+           (uniform across SBNS)
+2100–2150: CC scenario = 2024 baseline grid + anomaly(2099) (held constant)
+```{r}
+years_all <- 1991:2150
+
+# Helper to extract index of a given year layer in baseline stacks
+idx_year <- function(stack, prefix, year) {
+  which(names(stack) == paste0(prefix, "_", year))
+}
+
+# 2024 base fields
+idx_T2024 <- idx_year(temp_baseline_stack, "Temp", 2024)
+idx_S2024 <- idx_year(sal_baseline_stack,  "Sal",  2024)
+
+r_T2024 <- temp_baseline_stack[[idx_T2024]]
+r_S2024 <- sal_baseline_stack[[idx_S2024]]
+
+## ---- Temperature CC stack ----
+temp_cc_list <- vector("list", length(years_all))
+names(temp_cc_list) <- years_all
+
+for (i in seq_along(years_all)) {
+  y <- years_all[i]
+  
+  if (y <= 2024) {
+    # Historical period: identical to baseline
+    r_cc <- temp_baseline_stack[[i]]
+    
+  } else {
+    # Future period: 2024 base field + anomaly
+    # cap anomaly years to 2099 (after that: hold 2099 constant)
+    if (y <= 2099) {
+      y_clim <- y
+    } else {
+      y_clim <- 2099
+    }
+    
+    # anomaly (may be NA if outside 1991-2099)
+    a <- anom_sst[as.character(y_clim)]
+    
+    # start from 2024 baseline field
+    r_cc <- r_T2024
+    
+    # add anomaly only on sea cells
+    r_cc[sea_mask] <- r_cc[sea_mask] + a
+  }
+  
+  temp_cc_list[[as.character(y)]] <- r_cc
+}
+
+temp_cc_stack <- rast(temp_cc_list)
+names(temp_cc_stack) <- paste0("Temp_CC_", years_all)
+temp_cc_stack
+
+## ---- Salinity CC stack ----
+sal_cc_list <- vector("list", length(years_all))
+names(sal_cc_list) <- years_all
+
+for (i in seq_along(years_all)) {
+  y <- years_all[i]
+  
+  if (y <= 2024) {
+    # Historical: identical to baseline
+    r_cc <- sal_baseline_stack[[i]]
+    
+  } else {
+    if (y <= 2099) {
+      y_clim <- y
+    } else {
+      y_clim <- 2099
+    }
+    
+    a <- anom_sss[as.character(y_clim)]
+    
+    r_cc <- r_S2024
+    r_cc[sea_mask] <- r_cc[sea_mask] + a
+  }
+  
+  sal_cc_list[[as.character(y)]] <- r_cc
+}
+
+sal_cc_stack <- rast(sal_cc_list)
+names(sal_cc_stack) <- paste0("Sal_CC_", years_all)
+sal_cc_stack
+
+
+# Check
+plot(temp_cc_stack[[which(names(temp_cc_stack) %in% c("Temp_CC_2024","Temp_CC_2050","Temp_CC_2099","Temp_CC_2150"))]])
+plot(sal_cc_stack[[which(names(sal_cc_stack)  %in% c("Sal_CC_2024","Sal_CC_2050","Sal_CC_2099","Sal_CC_2150"))]])
+
+```
+
+Save data
+```{r}
+saveRDS(temp_cc_stack,
+        file = file.path(out_temp_cc, "Temp_CC_SSP3-7.0_1991_2150.rds"))
+
+saveRDS(sal_cc_stack,
+        file = file.path(out_sal_cc, "Sal_CC_SSP3-7.0_1991_2150.rds"))
+
+# Temperature .asc 
+for (i in seq_along(years_all)) {
+  y <- years_all[i]
+  r <- temp_cc_stack[[i]]
+  
+  r0 <- r
+  r0[!sea_mask] <- 0  # 0 on land/inactive
+  
+  writeRaster(
+    r0,
+    filename  = file.path(out_temp_cc, paste0("Temp_CC_SSP3-7.0_", y, ".asc")),
+    overwrite = TRUE
+  )
+}
+
+# Salinity .asc
+for (i in seq_along(years_all)) {
+  y <- years_all[i]
+  r <- sal_cc_stack[[i]]
+  
+  r0 <- r
+  r0[!sea_mask] <- 0
+  
+  writeRaster(
+    r0,
+    filename  = file.path(out_sal_cc, paste0("Sal_CC_SSP3-7.0_", y, ".asc")),
+    overwrite = TRUE
+  )
+}
+
+```
+
+Helper function for Montly data:
+```{r}
+compute_monthly_anoms_from_csv <- function(path_csv, ref_year = 2024, value_col = "value") {
+  df <- readr::read_csv(path_csv, show_col_types = FALSE)
+  
+  # Expect columns 'year' and 'month' (1–12)
+  stopifnot(all(c("year", "month") %in% names(df)))
+  
+  # Select only what's needed
+  df <- df %>% dplyr::select(year, month, !!value_col)
+  
+  # Reference: year == ref_year
+  df_ref <- df %>%
+    dplyr::filter(year == ref_year) %>%
+    dplyr::select(month, ref_val = !!value_col)
+  
+  if (nrow(df_ref) != 12) {
+    warning("Ref year does not have exactly 12 months in ", path_csv)
+  }
+  
+  df_anom <- df %>%
+    dplyr::left_join(df_ref, by = "month") %>%
+    dplyr::mutate(anom_ref = .data[[value_col]] - .data$ref_val)
+  
+  # Vector named "YYYY_MM"
+  key <- paste0(df_anom$year, "_", sprintf("%02d", df_anom$month))
+  anom_vec <- setNames(df_anom$anom_ref, key)
+  anom_vec
+}
+```
+
+Compute montly layers CC
+```{r}
+anom_sst_month <- compute_monthly_anoms_from_csv(
+  path_csv  = path_sst_csv,
+  ref_year  = 2024,
+  value_col = "value"
+)
+
+anom_sss_month <- compute_monthly_anoms_from_csv(
+  path_csv  = path_sss_csv,
+  ref_year  = 2024,
+  value_col = "value"
+)
+```
+
+Build CC raster stack
+```{r}
+years_all  <- 1991:2150
+months_all <- 1:12
+
+## Convenience: baseline 2024 monthly fields
+get_temp_2024_month <- function(m) {
+  nm <- sprintf("Temp_2024_%02d", m)
+  temp_baseline_monthly_stack[[nm]]
+}
+get_sal_2024_month <- function(m) {
+  nm <- sprintf("Sal_2024_%02d", m)
+  sal_baseline_monthly_stack[[nm]]
+}
+
+## ---- Temperature CC monthly stack ----
+temp_cc_monthly_list <- list()
+
+for (y in years_all) {
+  for (m in months_all) {
+    
+    if (y <= 2024) {
+      # Historical: identical to baseline
+      nm_base <- sprintf("Temp_%d_%02d", y, m)
+      r_cc <- temp_baseline_monthly_stack[[nm_base]]
+      
+    } else {
+      # Future: baseline 2024 month + anomaly
+      if (y <= 2099) {
+        y_clim <- y
+      } else {
+        y_clim <- 2099
+      }
+      
+      key <- paste0(y_clim, "_", sprintf("%02d", m))
+      a <- anom_sst_month[[key]]
+      if (is.null(a) || is.na(a)) {
+        stop("Missing SST monthly anomaly for ", key)
+      }
+      
+      r_cc <- get_temp_2024_month(m)
+      r_cc[sea_mask] <- r_cc[sea_mask] + a
+    }
+    
+    out_name <- sprintf("Temp_CC_%d_%02d", y, m)
+    temp_cc_monthly_list[[out_name]] <- r_cc
+  }
+}
+
+temp_cc_monthly_stack <- rast(temp_cc_monthly_list)
+temp_cc_monthly_stack
+
+
+## ---- Salinity CC monthly stack ----
+sal_cc_monthly_list <- list()
+
+for (y in years_all) {
+  for (m in months_all) {
+    
+    if (y <= 2024) {
+      nm_base <- sprintf("Sal_%d_%02d", y, m)
+      r_cc <- sal_baseline_monthly_stack[[nm_base]]
+      
+    } else {
+      if (y <= 2099) {
+        y_clim <- y
+      } else {
+        y_clim <- 2099
+      }
+      
+      key <- paste0(y_clim, "_", sprintf("%02d", m))
+      a <- anom_sss_month[[key]]
+      if (is.null(a) || is.na(a)) {
+        stop("Missing SSS monthly anomaly for ", key)
+      }
+      
+      r_cc <- get_sal_2024_month(m)
+      r_cc[sea_mask] <- r_cc[sea_mask] + a
+    }
+    
+    out_name <- sprintf("Sal_CC_%d_%02d", y, m)
+    sal_cc_monthly_list[[out_name]] <- r_cc
+  }
+}
+
+sal_cc_monthly_stack <- rast(sal_cc_monthly_list)
+sal_cc_monthly_stack
+```
+
+Save monthly CC data:
+```{r}
+# Temperature CC monthly .asc
+for (y in years_all) {
+  for (m in months_all) {
+    lyr_name <- sprintf("Temp_CC_%d_%02d", y, m)
+    r <- temp_cc_monthly_stack[[lyr_name]]
+    
+    r0 <- r
+    r0[!sea_mask] <- 0
+    
+    fn <- file.path(
+      out_temp_cc,
+      sprintf("Temp_CC_SSP3-7.0_%d_%02d.asc", y, m)
+    )
+    
+    writeRaster(r0, filename = fn, overwrite = TRUE)
+  }
+}
+
+# Salinity CC monthly .asc
+for (y in years_all) {
+  for (m in months_all) {
+    lyr_name <- sprintf("Sal_CC_%d_%02d", y, m)
+    r <- sal_cc_monthly_stack[[lyr_name]]
+    
+    r0 <- r
+    r0[!sea_mask] <- 0
+    
+    fn <- file.path(
+      out_sal_cc,
+      sprintf("Sal_CC_SSP3-7.0_%d_%02d.asc", y, m)
+    )
+    
+    writeRaster(r0, filename = fn, overwrite = TRUE)
+  }
+}
+```
+
+Now we have the monthly layers of temperature and salinity from 1991-2150, we can calculate for each year and for each species (with available response data) a suitability raster.Stored in separate folders under "suitability_temp/species-name" and "suitability_sal/species-name".
+
+Helper function: suitability from monthly rasters
+```{r}
+library(terra)
+library(readr)
+library(dplyr)
+
+# --- helper: safe species name for filenames
+safe_name <- function(x) {
+  x %>%
+    gsub("[[:space:]]+", "_", .) %>%     # spaces -> _
+    gsub("[^A-Za-z0-9_\\-]", "", .)      # drop weird chars
+}
+
+# --- compute annual mean response raster from 12 monthly env rasters
+# r_month: SpatRaster with 12 layers (months)
+# x_grid: numeric vector of env values in response curve (Var_resp$variable)
+# y_curve: numeric vector of response (0-1) for ONE species
+annual_mean_response <- function(r_month, x_grid, y_curve) {
+  terra::app(
+    r_month,
+    fun = function(v) {
+      # v is length-12 vector (one cell, 12 months)
+      if (all(is.na(v))) return(NA_real_)
+      # interpolate response per month, then average
+      mean(approx(x = x_grid, y = y_curve, xout = v, rule = 2)$y, na.rm = TRUE)
+    }
+  )
+}
+```
+
+Helper function: build suitability rasters and save per scenario
+```{r}
+build_suitability_yearly_rasters <- function(
+  in_dir,
+  out_dir,
+  file_prefix,
+  resp_csv,
+  years = 1991:2150,
+  months = 1:12,
+  sea_mask = NULL
+) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  Var_resp <- readr::read_csv(resp_csv, show_col_types = FALSE) |> as.data.frame()
+  stopifnot("variable" %in% names(Var_resp))
+
+  x_grid <- Var_resp$variable
+  species_names <- setdiff(names(Var_resp), "variable")
+  message("Found ", length(species_names), " species in response table.")
+
+  safe_name <- function(x) {
+    x |>
+      gsub("[[:space:]]+", "_", x = _) |>
+      gsub("[^A-Za-z0-9_\\-]", "", x = _)
+  }
+
+  annual_mean_response <- function(r_month, x_grid, y_curve) {
+    terra::app(
+      r_month,
+      fun = function(v) {
+        if (all(is.na(v))) return(NA_real_)
+        mean(approx(x = x_grid, y = y_curve, xout = v, rule = 2)$y, na.rm = TRUE)
+      }
+    )
+  }
+
+  for (y in years) {
+
+    f_month <- file.path(
+      in_dir,
+      sprintf("%s_%d_%02d.asc", file_prefix, y, months)
+    )
+    missing <- f_month[!file.exists(f_month)]
+    if (length(missing) > 0) {
+      stop("Missing monthly rasters for year ", y, ". Example missing file: ", missing[1])
+    }
+
+    r_month <- terra::rast(f_month)
+
+    # Prevent land zeros from biasing suitability
+    if (!is.null(sea_mask)) {
+      r_month[!sea_mask] <- NA
+    }
+
+    for (sp in species_names) {
+
+      sp_safe <- safe_name(sp)
+
+      # Create species subfolder
+      sp_dir <- file.path(out_dir, sp_safe)
+      dir.create(sp_dir, recursive = TRUE, showWarnings = FALSE)
+
+      y_curve <- Var_resp[[sp]]
+      r_suit  <- annual_mean_response(r_month, x_grid, y_curve)
+
+      # Write 0 on land
+      r_out <- r_suit
+      if (!is.null(sea_mask)) {
+        r_out[!sea_mask] <- 0
+      } else {
+        r_out[is.na(r_out)] <- 0
+      }
+
+      fn_out <- file.path(
+        sp_dir,
+        sprintf("Suit_%s_%s_%d.asc", file_prefix, sp_safe, y)
+      )
+
+      terra::writeRaster(r_out, filename = fn_out, overwrite = TRUE)
+    }
+
+    message("Done year: ", y)
+  }
+
+  invisible(TRUE)
+}
+```
+
+Apply function to baseline and climate change scenario, for both temperature and salinity:
+Define directories
+```{r}
+base_dir <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/Spatial data"
+out_root <- file.path(base_dir, "Processed")
+
+# Monthly env rasters already exist here:
+out_temp_baseline <- file.path(out_root, "Temperature", "Baseline")
+out_sal_baseline  <- file.path(out_root, "Salinity",   "Baseline")
+
+out_temp_cc <- file.path(out_root, "Temperature", "ClimateChange_SSP3-7.0")
+out_sal_cc  <- file.path(out_root, "Salinity",   "ClimateChange_SSP3-7.0")
+
+# Suggested output structure for suitability rasters:
+out_suit_temp_baseline <- file.path(out_root, "Suitability", "Temperature", "Baseline")
+out_suit_sal_baseline  <- file.path(out_root, "Suitability", "Salinity",   "Baseline")
+
+out_suit_temp_cc <- file.path(out_root, "Suitability", "Temperature", "ClimateChange_SSP3-7.0")
+out_suit_sal_cc  <- file.path(out_root, "Suitability", "Salinity",   "ClimateChange_SSP3-7.0")
+```
+
+To reduce calculation time: use same approach as for original layer calculation:
+Baseline: Calculate species suitabilit for 1993-2024
+1991 and 1992 --> use 1993
+2025-2150 --> use 2024
+
+Climate Change: Calculate species suitabilit for 1993-2099
+1991 and 1992 --> use 1993
+2100 - 2150 --> use 2099
+Baseline suitabilities for Temp ans Sal:
+```{r}
+# response curves CSVs (use your actual paths)
+resp_temp_csv <- "Temp_Ecosim_format_DL_CC_adapted.csv"
+resp_sal_csv  <- "Sal_Ecosim_format_DL_CC_adapted.csv"
+
+years_all <- 1991:2150
+
+# baseline: 1991-1992 same as 1993, and 2025-2150 same as 2024
+year_map_baseline <- setNames(years_all, years_all)
+year_map_baseline[c("1991","1992")] <- 1993
+year_map_baseline[as.character(2025:2150)] <- 2024
+
+# unique source years you actually need to compute
+source_years_baseline <- sort(unique(unname(year_map_baseline)))
+
+# ------------------------------------------------------------
+# Helper to copy computed source-year suitability rasters
+# to all target years (keeps per-year files for EwE)
+# ------------------------------------------------------------
+copy_suitability_years <- function(out_dir, file_prefix, year_map) {
+  # out_dir has species subfolders
+  species_dirs <- list.dirs(out_dir, recursive = FALSE, full.names = TRUE)
+
+  for (sp_dir in species_dirs) {
+    sp <- basename(sp_dir)
+
+    for (y in as.integer(names(year_map))) {
+      y_src <- as.integer(year_map[[as.character(y)]])
+      if (y == y_src) next
+
+      src <- file.path(sp_dir, sprintf("Suit_%s_%s_%d.asc", file_prefix, sp, y_src))
+      dst <- file.path(sp_dir, sprintf("Suit_%s_%s_%d.asc", file_prefix, sp, y))
+
+      if (!file.exists(src)) {
+        stop("Missing source file: ", src)
+      }
+      if (!file.exists(dst)) {
+        file.copy(src, dst, overwrite = TRUE)
+      }
+    }
+  }
+  invisible(TRUE)
+}
+
+# Temperature baseline
+build_suitability_yearly_rasters(
+  in_dir      = out_temp_baseline,
+  out_dir     = out_suit_temp_baseline,
+  file_prefix = "Temp_Baseline",
+  resp_csv    = resp_temp_csv,
+  years       = source_years_baseline,
+  sea_mask    = sea_mask
+)
+
+copy_suitability_years(
+  out_dir     = out_suit_temp_baseline,
+  file_prefix = "Temp_Baseline",
+  year_map    = year_map_baseline
+)
+
+# Salinity baseline
+years_all <- 1991:2150
+
+year_map_baseline <- setNames(years_all, as.character(years_all))
+year_map_baseline[c("1991","1992")] <- 1993
+year_map_baseline[as.character(2025:2150)] <- 2024
+
+source_years_baseline <- sort(unique(unname(year_map_baseline)))
+
+build_suitability_yearly_rasters(
+  in_dir      = out_sal_baseline,
+  out_dir     = out_suit_sal_baseline,
+  file_prefix = "Sal_Baseline",
+  resp_csv    = resp_sal_csv,
+  years       = source_years_baseline,
+  sea_mask    = sea_mask
+)
+
+
+copy_suitability_years(
+  out_dir     = out_suit_sal_baseline,
+  file_prefix = "Sal_Baseline",
+  year_map    = year_map_baseline
+)
+
+```
+
+CC suitabilities for Temp and Sal:
+```{r}
+# Response curves CSVs (paths)
+resp_temp_csv <- "Temp_Ecosim_format_DL_CC_adapted.csv"
+resp_sal_csv  <- "Sal_Ecosim_format_DL_CC_adapted.csv"
+
+years_all <- 1991:2150
+
+# ------------------------------------------------------------
+# Year mapping for CC
+# - 1991 & 1992 identical to 1993 (as you mentioned)
+# - 2100–2150 identical to 2099 (because you capped y_clim at 2099)
+# ------------------------------------------------------------
+year_map_cc <- setNames(years_all, as.character(years_all))
+year_map_cc[c("1991","1992")] <- 1993
+year_map_cc[as.character(2100:2150)] <- 2099
+
+source_years_cc <- sort(unique(unname(year_map_cc)))
+
+# ------------------------------------------------------------
+# Helper to copy computed source-year suitability rasters
+# to all target years (keeps per-year files for EwE)
+# ------------------------------------------------------------
+copy_suitability_years <- function(out_dir, file_prefix, year_map) {
+  # out_dir has species subfolders
+  species_dirs <- list.dirs(out_dir, recursive = FALSE, full.names = TRUE)
+
+  for (sp_dir in species_dirs) {
+    sp <- basename(sp_dir)
+
+    for (y in as.integer(names(year_map))) {
+      y_src <- as.integer(year_map[[as.character(y)]])
+      if (y == y_src) next
+
+      src <- file.path(sp_dir, sprintf("Suit_%s_%s_%d.asc", file_prefix, sp, y_src))
+      dst <- file.path(sp_dir, sprintf("Suit_%s_%s_%d.asc", file_prefix, sp, y))
+
+      if (!file.exists(src)) {
+        stop("Missing source file: ", src)
+      }
+      if (!file.exists(dst)) {
+        file.copy(src, dst, overwrite = TRUE)
+      }
+    }
+  }
+  invisible(TRUE)
+}
+
+# ============================================================
+# TEMPERATURE — CC
+# ============================================================
+
+build_suitability_yearly_rasters(
+  in_dir      = out_temp_cc,
+  out_dir     = out_suit_temp_cc,
+  file_prefix = "Temp_CC_SSP3-7.0",
+  resp_csv    = resp_temp_csv,
+  years       = source_years_cc,
+  sea_mask    = sea_mask
+)
+
+copy_suitability_years(
+  out_dir     = out_suit_temp_cc,
+  file_prefix = "Temp_CC_SSP3-7.0",
+  year_map    = year_map_cc
+)
+
+# ============================================================
+# SALINITY — CC
+# ============================================================
+
+build_suitability_yearly_rasters(
+  in_dir      = out_sal_cc,
+  out_dir     = out_suit_sal_cc,
+  file_prefix = "Sal_CC_SSP3-7.0",
+  resp_csv    = resp_sal_csv,
+  years       = source_years_cc,
+  sea_mask    = sea_mask
+)
+
+copy_suitability_years(
+  out_dir     = out_suit_sal_cc,
+  file_prefix = "Sal_CC_SSP3-7.0",
+  year_map    = year_map_cc
+)
+```
+
+
+```{r}
+## shapefiles:
+# Study area (SBNS)
+("C:\Users\dlorr\OneDrive - UGent\Documents\PhD\EwE_OWF\Spatial data\SBNS_boundary_epsg3857.shp")
+
+
+# Habitat layers (Folk 5 - high resolution)
+("C:\Users\dlorr\OneDrive - UGent\Documents\PhD\EwE_OWF\Spatial data\SedimentHabitats\seabed_substrate_1k5_multiscale.shp")
+
+
+# Offshore wind farm polygons (Operational and planned)
+("C:\Users\dlorr\OneDrive - UGent\Documents\PhD\EwE_OWF\Spatial data\OffshoreWindFarms\EMODnet_HA_Energy_WindFarms_pg_20250825.shp")
+
+# ----------------------------------------------------
+## Rasters:
+# Primary production
+("C:\Users\dlorr\OneDrive - UGent\Documents\PhD\EwE_OWF\Spatial data\PrimaryProduction_1km_98-25")
+# Files with structure: 19980101-19980131_cmems_obs-oc_atl_bgc-pp_my_l4-multi-1km_P1M.nc
+# -->This is a file of the year 1998, January
+# 20030201-20030228_cmems_obs-oc_atl_bgc-pp_my_l4-multi-1km_P1M.nc
+# --> this is a file of the year 2003, February
+
+# Depth
+("C:\Users\dlorr\OneDrive - UGent\Documents\PhD\EwE_OWF\Spatial data\Depth")
+# 4 Files in this map:
+# Depth_Tile_D4.tiff
+# Depth_Tile_D5.tiff
+# Depth_Tile_E4.tiff
+# Depth_Tile_E5.tiff
+# --> for study area (SBNS) these have to be merged and clipped to SBNS extend.
+
+# Temperature
+("C:\Users\dlorr\OneDrive - UGent\Documents\PhD\EwE_OWF\Spatial data\Temperature")
+# Files with structure:
+# CMEMS_v6r1_IBI_PHY_MY_NL_01mav_temp_19930101_19930131_R20251125_RE01.nc
+# This is a file of the year 1993, January
+# CMEMS_v6r1_IBI_PHY_MY_NL_01mav_temp_19970601_19970630_R20251125_RE01.nc
+# This is a file of the year 1997, June
+
+# Salinity
+("C:\Users\dlorr\OneDrive - UGent\Documents\PhD\EwE_OWF\Spatial data\Salinity")
+# Files with structure:
+# CMEMS_v6r1_IBI_PHY_MY_NL_01mav_sal_19930101_19930131_R20251125_RE01.nc
+# This is a file of the year 1993, January
+# CMEMS_v6r1_IBI_PHY_MY_NL_01mav_sal_19961201_19961231_R20251125_RE01.nc
+# This is a file of the year 1996, December
+
+# Dissoleved Oxygen
+("C:\Users\dlorr\OneDrive - UGent\Documents\PhD\EwE_OWF\Spatial data\OxygenConc")
+# Files with structure:
+# metoffice_foam1_amm7_NWS_DOXY_mm199301.nc
+# This is a file of the year 1993, January
+# metoffice_foam1_amm7_NWS_DOXY_mm200005.nc
+# This is a file of the year 2000, May
+```
+
+Base map grid --> check
+- depth map
+- 1km x 1km
+- 1 field, make sure all grid cells are connected (no lose "islands" in active cells - islands are set to 0 - only keep biggest one (i.e., SBNS study area))
+- base grid structure on PP grid (1km x 1km?)
+```{r}
+
+
+
+```
+
+Using this base map, sample spatial (temporal) data layers for environmental and habitat data inputs
+
+Primary production - mean 1998-2025
+```{r}
+# unit input = mgC/m²/day
+# unit should be mgC/m³/day --> devide by depth (m)
+
+
+
+```
+
+Depth - resampled from high resolution grid to base map grid --> done
+```{r}
+# 0 = land, (positive) values = depth
+# unit = meters
+
+
+
+```
+
+Distance to land
+```{r}
+# unit = km
+
+
+
+```
+
+
+Coastal - Marine
+```{r}
+# 12 nautical miles from shore = Coastal
+# further away = Marine
+
+# Check values input Püts et al. (2020)
+# probably have to make 2 of these.
+# 1) Coastal = 0.75, marine = 1
+# 2) Coastal = 1, marine = 0.75
+
+
+
+```
+
+
+Sediment habitats - proportion of habitat in cell
+```{r}
+# Sum of all habitat layers should thus equal 1 for each cell!
+# Shapefile should be transformed in 5 habitat rasters (one for each habitat)
+
+
+
+```
+
+Temperature - yearly average SST in cell
+[NOTE: Below the historical data. Future projections added later in the script]
+```{r}
+# unit = °C
+
+
+
+```
+
+Salinity - yearly average SSS in cell
+[NOTE: Below the historical data. Future projections added later in the script]
+```{r}
+# unit = psu
+
+
+
+```
+
+

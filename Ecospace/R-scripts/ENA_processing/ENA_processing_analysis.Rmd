@@ -1,0 +1,1717 @@
+---
+title: "ENA_processing"
+author: "Dries Lorré"
+date: "2026-03-16"
+output: html_document
+---
+
+```{r}
+library(enaR)
+library(NetIndices)
+library(igraph)
+library(dplyr)
+library(sf)
+library(terra)
+```
+Directories
+```{r}
+scenario_dirs <- c(
+  Baseline  = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_baseline_test",
+  CC        = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_CC_test",
+  OWF       = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_test",
+  OWF_CC    = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_CC_test"
+)
+
+csv_subfolder <- "Test_Env_resps"
+
+# load pre-cropped land object
+land_main <- readRDS(
+  "land_main_study_area.rds"
+)
+land_main_df <- land_main |>
+  st_cast("MULTIPOLYGON") |>
+  st_cast("POLYGON") |>
+  mutate(poly_id = row_number())
+
+land_main_df_plot <- do.call(
+  rbind,
+  lapply(seq_len(nrow(land_main_df)), function(i) {
+    coords <- st_coordinates(land_main_df[i, ])
+    data.frame(
+      x = coords[, 1],
+      y = coords[, 2],
+      poly_id = i
+    )
+  })
+)
+
+# 
+get_timestep_path <- function(scenario, timestep = "01920") {
+  file.path(
+    scenario_dirs[[scenario]],
+    csv_subfolder,
+    "ena_data",
+    paste0("TimeStep=", timestep)
+  )
+}
+
+ts_path <- get_timestep_path("Baseline", "01920")
+# Test file 
+file_test <- list.files(ts_path, pattern = "\\.txt$", full.names = TRUE)[1]
+file_test
+```
+read SCOR file and run ENA modules
+```{r}
+net <- read.scor(file_test)
+
+flow <- enaFlow(net)
+asc  <- enaAscendency(net)
+tro  <- enaTroAgg(net)
+
+```
+
+Test if we can calculate all indicators:
+```{r}
+FCI <- as.numeric(flow$ns[1, "FCI"])
+H   <- as.numeric(asc[1, "H"])
+
+# Candidate 1: total relative overhead
+RDC_OH_CAP <- as.numeric(asc[1, "OH.CAP"])
+
+# Candidate 2: internal overhead / total capacity
+RDC_internal_CAP <- as.numeric(asc[1, "OH.internal"]) / as.numeric(asc[1, "CAP"])
+
+```
+
+SOI
+```{r}
+library(network)
+# Extract flow matrix to calculate omnivory
+F    <- as.matrix.network.adjacency(net, attrname = "flow")   # for SOI
+
+# Check
+# dim(F)          OK
+# F[1:5, 1:5]     OK
+# rownames(F)     OK
+# colnames(F)     OK
+
+library(NetIndices)
+
+# dead matter compartments
+dead_nodes <- c("Detritus", "Discards")
+
+# trophic levels and node omnivory
+ti <- TrophInd(
+  Flow = F,
+  Dead = dead_nodes
+)
+
+# head(ti)
+# summary(ti$TL)
+# summary(ti$OI) # --> OI for individual species
+
+# weighted system omnivory index
+Q <- colSums(F)
+consumers <- !(rownames(F) %in% dead_nodes)
+
+valid_exact <- consumers & is.finite(ti$OI) & is.finite(Q) & Q > 0
+
+SOI_exact <- sum(ti$OI[valid_exact] * log(Q[valid_exact])) /
+             sum(log(Q[valid_exact])) #correct calculation!
+# SOI_unweighted <- mean(ti$OI[consumers & is.finite(ti$OI)])
+# valid_Q <- consumers & is.finite(ti$OI) & is.finite(Q) & Q > 0
+# 
+# SOI_Qweighted <- sum(ti$OI[valid_Q] * Q[valid_Q]) /
+#                  sum(Q[valid_Q])
+# Combination of all metrics for test cell
+one_cell_metrics <- data.frame(
+  file = basename(file_test),
+  FCI = FCI,
+  H = H,
+  RDC_OH_CAP = RDC_OH_CAP,
+  RDC_internal_CAP = RDC_internal_CAP,
+  SOI_exact = SOI_exact #,
+  # SOI_unweighted = SOI_unweighted,
+  # SOI_Qweighted = SOI_Qweighted
+)
+one_cell_metrics
+```
+
+SCRIPT FOR ALL CELLS AND ALL SCENARIO'S
+Helper function for one SCOR file
+```{r}
+library(enaR)
+library(NetIndices)
+library(network)
+library(dplyr)
+library(purrr)
+library(stringr)
+
+compute_ENA_indices <- function(file,
+                                dead_nodes = c("Detritus", "Discards")) {
+  out <- tryCatch({
+    net <- read.scor(file)
+
+    flow <- enaFlow(net)
+    asc  <- enaAscendency(net)
+
+    F <- as.matrix.network.adjacency(net, attrname = "flow")
+
+    ti <- TrophInd(
+      Flow = F,
+      Dead = dead_nodes
+    )
+
+    Q <- colSums(F)
+    consumers <- !(rownames(F) %in% dead_nodes)
+    valid <- consumers & is.finite(ti$OI) & is.finite(Q) & Q > 0
+
+    SOI <- sum(ti$OI[valid] * log(Q[valid])) / sum(log(Q[valid]))
+
+    data.frame(
+      file = basename(file),
+      FCI = as.numeric(flow$ns[1, "FCI"]),
+      H = as.numeric(asc[1, "H"]),
+      RDC_OH_CAP = as.numeric(asc[1, "OH.CAP"]),
+      RDC_internal_CAP = as.numeric(asc[1, "OH.internal"]) / as.numeric(asc[1, "CAP"]),
+      SOI = SOI,
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) {
+    data.frame(
+      file = basename(file),
+      FCI = NA_real_,
+      H = NA_real_,
+      RDC_OH_CAP = NA_real_,
+      RDC_internal_CAP = NA_real_,
+      SOI = NA_real_,
+      stringsAsFactors = FALSE
+    )
+  })
+
+  out
+}
+```
+
+Test function for 1 time step
+
+In total, there are 9739 cells, for each time step, for each scenario for which ENA indicators are calculated.
+```{r}
+scenario_dirs <- c(
+  Baseline  = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_baseline_test",
+  CC        = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_CC_test",
+  OWF       = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_test",
+  OWF_CC    = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_CC_test"
+)
+
+csv_subfolder <- "Test_Env_resps"
+
+get_timestep_path <- function(scenario, timestep = "01920") {
+  file.path(
+    scenario_dirs[[scenario]],
+    csv_subfolder,
+    "ena_data",
+    paste0("TimeStep=", timestep)
+  )
+}
+
+ts_path <- get_timestep_path("Baseline", "01920")
+
+files <- list.files(ts_path, pattern = "\\.txt$", full.names = TRUE)
+
+# Use multisession, using all cores to process the data to speed up.
+install.packages("furrr")
+library(furrr)
+library(future)
+
+plan(multisession, workers = 10)
+
+ena_results_1920 <- future_map_dfr(
+  files,
+  compute_ENA_indices,
+  .progress = TRUE
+)
+
+ena_results_1920 <- purrr::map_dfr(files, compute_ENA_indices)
+
+head(ena_results_1920)
+summary(ena_results_1920)
+```
+
+Full workflow for all scenario's
+
+Install all packages
+```{r}
+library(enaR)
+library(NetIndices)
+library(network)
+library(dplyr)
+library(purrr)
+library(furrr)
+library(stringr)
+library(terra)
+library(future)
+
+plan(multisession, workers = 10)
+```
+
+Paths and settings
+```{r}
+scenario_dirs <- c(
+  Baseline  = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_baseline_test",
+  CC        = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_CC_test",
+  OWF       = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_test",
+  OWF_CC    = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_CC_test"
+)
+
+csv_subfolder <- "Test_Env_resps"
+timesteps <- sprintf("%04d", 1909:1920)   # because filenames/folders use 01909 etc below
+dead_nodes <- c("Detritus", "Discards")
+
+get_timestep_path <- function(scenario, timestep) {
+  file.path(
+    scenario_dirs[[scenario]],
+    csv_subfolder,
+    "ena_data",
+    paste0("TimeStep=0", timestep)
+  )
+}
+```
+
+Helper function for ENA analysis on one file
+```{r}
+compute_ENA_indices <- function(file, dead_nodes = c("Detritus", "Discards")) {
+  
+  out <- tryCatch({
+    net <- read.scor(file)
+    
+    flow <- enaFlow(net)
+    asc  <- enaAscendency(net)
+    
+    F <- as.matrix.network.adjacency(net, attrname = "flow")
+    
+    ti <- TrophInd(
+      Flow = F,
+      Dead = dead_nodes
+    )
+    
+    Q <- colSums(F)
+    consumers <- !(rownames(F) %in% dead_nodes)
+    valid_soi <- consumers & is.finite(ti$OI) & is.finite(Q) & Q > 0
+    
+    soi_num <- sum(ti$OI[valid_soi] * log(Q[valid_soi]))
+    soi_den <- sum(log(Q[valid_soi]))
+    SOI <- soi_num / soi_den
+    
+    fname <- basename(file)
+    
+    row_id <- as.integer(str_extract(fname, "^\\d{4}"))
+    col_id <- as.integer(str_extract(fname, "(?<=^)\\d{4}(?=-\\d{4})"))  # not used
+    # better extraction:
+    parts <- str_match(fname, "^(\\d{4})-(\\d{4})-")
+    row_id <- as.integer(parts[,2])
+    col_id <- as.integer(parts[,3])
+    
+    FCI <- as.numeric(flow$ns[1, "FCI"])
+    H   <- as.numeric(asc[1, "H"])
+    RDC_OH_CAP <- as.numeric(asc[1, "OH.CAP"])
+    RDC_internal_CAP <- as.numeric(asc[1, "OH.internal"]) / as.numeric(asc[1, "CAP"])
+    
+    # optional filtered versions for mapping/averaging
+    FCI_map <- ifelse(is.finite(FCI) & FCI >= 0 & FCI <= 1, FCI, NA_real_)
+    SOI_map <- ifelse(is.finite(SOI) & SOI > -1 & SOI < 1, SOI, NA_real_)
+    
+    data.frame(
+      file = fname,
+      row = row_id,
+      col = col_id,
+      FCI = FCI,
+      H = H,
+      RDC_OH_CAP = RDC_OH_CAP,
+      RDC_internal_CAP = RDC_internal_CAP,
+      SOI = SOI,
+      FCI_map = FCI_map,
+      SOI_map = SOI_map,
+      stringsAsFactors = FALSE
+    )
+    
+  }, error = function(e) {
+    fname <- basename(file)
+    parts <- str_match(fname, "^(\\d{4})-(\\d{4})-")
+    row_id <- as.integer(parts[,2])
+    col_id <- as.integer(parts[,3])
+    
+    data.frame(
+      file = fname,
+      row = row_id,
+      col = col_id,
+      FCI = NA_real_,
+      H = NA_real_,
+      RDC_OH_CAP = NA_real_,
+      RDC_internal_CAP = NA_real_,
+      SOI = NA_real_,
+      FCI_map = NA_real_,
+      SOI_map = NA_real_,
+      stringsAsFactors = FALSE
+    )
+  })
+  
+  out
+}
+```
+
+Helper function to run this code for one time step, for one scenario
+```{r}
+run_one_timestep <- function(scenario, timestep, dead_nodes) {
+
+  ts_path <- get_timestep_path(scenario, timestep)
+
+  files <- list.files(ts_path, pattern = "\\.txt$", full.names = TRUE)
+
+  res <- furrr::future_map_dfr(
+    files,
+    compute_ENA_indices,
+    dead_nodes = dead_nodes
+  )
+
+  res$scenario <- scenario
+  res$timestep <- timestep
+
+  res
+}
+```
+
+One scenario, all time steps
+```{r}
+run_one_scenario <- function(scenario, timesteps, dead_nodes = c("Detritus", "Discards")) {
+  
+  purrr::map_dfr(timesteps, function(ts) {
+    message("Running ", scenario, " timestep ", ts)
+    run_one_timestep(scenario, ts, dead_nodes = dead_nodes)
+  })
+}
+```
+
+All scenario's
+```{r, echo=FALSE}
+all_results <- purrr::map_dfr(names(scenario_dirs), function(sc) {
+  message("========== Scenario: ", sc, " ==========")
+  run_one_scenario(sc, timesteps, dead_nodes = dead_nodes)
+})
+
+# Save restuls
+saveRDS(all_results, 
+        "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/ENA_all_results.rds")
+
+write.csv(
+  all_results,
+  "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/ENA_all_results.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+safe_mean <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+# optional filtering for unstable values
+# all_results <- all_results %>%
+#   mutate(
+#     FCI_map = ifelse(is.finite(FCI) & FCI >= 0 & FCI <= 1, FCI, NA_real_),
+#     SOI_map = ifelse(is.finite(SOI) & SOI > -1 & SOI < 1, SOI, NA_real_)
+#   )
+
+# average over timesteps per scenario and cell
+avg_results <- all_results %>%
+  group_by(scenario, row, col) %>%
+  summarise(
+    FCI = safe_mean(FCI_map),
+    H = safe_mean(H),
+    RDC_OH_CAP = safe_mean(RDC_OH_CAP),
+    RDC_internal_CAP = safe_mean(RDC_internal_CAP),
+    SOI = safe_mean(SOI_map),
+    .groups = "drop"
+  )
+```
+
+Conversion to raster
+```{r}
+# function to write values into the template
+df_to_raster_template <- function(df, value_col, template) {
+  r <- template
+  values(r) <- NA_real_
+  cell_ids <- cellFromRowCol(r, df$row, df$col)
+  r[cell_ids] <- df[[value_col]]
+  r
+}
+```
+
+```{r}
+template_raster <- rast("Temp_Baseline_1991.asc")
+baseline_avg <- avg_results %>% filter(scenario == "Baseline")
+
+r_H_baseline <- df_to_raster_template(baseline_avg, "H", template_raster)
+r_SOI_baseline <- df_to_raster_template(baseline_avg, "SOI", template_raster)
+r_FCI_baseline <- df_to_raster_template(baseline_avg, "FCI", template_raster)
+r_RDC_baseline <- df_to_raster_template(baseline_avg, "RDC_internal_CAP", template_raster)
+r_RDCOH_baseline <- df_to_raster_template(baseline_avg, "RDC_OH_CAP", template_raster)
+
+plot(r_H_baseline)
+plot(r_SOI_baseline)
+plot(r_FCI_baseline)
+plot(r_RDC_baseline)
+plot(r_RDCOH_baseline)
+
+```
+
+Rasters for all scenario's
+```{r}
+indicators <- c("FCI", "H", "RDC_OH_CAP", "RDC_internal_CAP", "SOI")
+scenarios <- unique(avg_results$scenario)
+
+raster_list <- list()
+
+for (sc in scenarios) {
+  df_sc <- avg_results %>% filter(scenario == sc)
+  raster_list[[sc]] <- list()
+
+  for (ind in indicators) {
+    raster_list[[sc]][[ind]] <- df_to_raster_template(df_sc, ind, template_raster)
+  }
+}
+
+out_dir <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/R-scripts/ENA_processing/ENA_rasters"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (sc in names(raster_list)) {
+  for (ind in names(raster_list[[sc]])) {
+    writeRaster(
+      raster_list[[sc]][[ind]],
+      file.path(out_dir, paste0("ENA_", ind, "_", sc, "_mean.tif")),
+      overwrite = TRUE
+    )
+  }
+}
+
+# plot(raster_list$OWF$SOI)
+# plot(raster_list$CC$H)
+# plot(raster_list$OWF_CC$RDC_internal_CAP)
+```
+
+PLOTTING OF ENA DATA
+```{r}
+library(terra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(stringr)
+library(tibble)
+library(grid)
+```
+
+
+```{r}
+# =========================================================
+# DIRECTORIES
+# =========================================================
+ena_dir <- "C:/Users/dlorr/OneDrive - UGent/Documents/PhD/EwE_OWF/R-scripts/ENA_processing/ENA_rasters"
+zone_raster_file <- file.path(ena_dir, "OWF_MPA_2150.asc")
+
+out_dir <- file.path(ena_dir, "ENA_plots")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+```{r}
+# =========================================================
+# SETTINGS
+# =========================================================
+indicators <- c("FCI", "H", 
+                # "RDC_OH_CAP",
+                "RDC_internal_CAP", "SOI")
+
+indicator_label_map <- c(
+  "FCI" = "FCI",
+  "H" = "H",
+  "RDC_internal_CAP" = "RDC",
+  "SOI" = "SOI"
+)
+
+scenario_order_raw <- c("Baseline", "CC", "OWF", "OWF_CC")
+
+scenario_order_plot <- c("CC", "OWF", "OWF + CC")
+
+scenario_label_map <- c(
+  "Baseline" = "Baseline",
+  "CC"       = "CC",
+  "OWF"      = "OWF",
+  "OWF_CC"   = "OWF + CC"
+)
+```
+
+
+```{r}
+# =========================================================
+# HELPER: READ ONE ENA RASTER
+# =========================================================
+read_ena_raster <- function(indicator, scenario, ena_dir) {
+  
+  f <- file.path(
+    ena_dir,
+    paste0("ENA_", indicator, "_", scenario, "_mean.tif")
+  )
+  
+  if (!file.exists(f)) {
+    stop("File not found: ", f)
+  }
+  
+  r <- rast(f)
+  
+  df <- as.data.frame(r, xy = TRUE, cells = TRUE, na.rm = FALSE)
+  names(df)[names(df) == names(r)] <- "value"
+  
+  df %>%
+    transmute(
+      cell = cell,
+      Lon = x,
+      Lat = y,
+      value = value,
+      indicator = indicator,
+      scenario_raw = scenario
+    )
+}
+```
+
+
+```{r}
+# =========================================================
+# READ ALL RASTERS
+# =========================================================
+ena_df <- bind_rows(
+  lapply(scenario_order_raw, function(sc) {
+    bind_rows(
+      lapply(indicators, function(ind) {
+        read_ena_raster(ind, sc, ena_dir)
+      })
+    )
+  })
+) %>%
+  mutate(
+    scenario = recode(scenario_raw, !!!scenario_label_map),
+    indicator = factor(indicator, levels = indicators)
+  )
+```
+
+
+```{r}
+# =========================================================
+# BASELINE AND % CHANGE VS BASELINE
+# =========================================================
+baseline_ref <- ena_df %>%
+  filter(scenario == "Baseline") %>%
+  select(cell, indicator, baseline_value = value)
+
+scenario_change_df <- ena_df %>%
+  filter(scenario != "Baseline") %>%
+  left_join(baseline_ref, by = c("cell", "indicator")) %>%
+  mutate(
+    pct_change = case_when(
+      baseline_value == 0 & value == 0 ~ 0,
+      baseline_value == 0 & value != 0 ~ NA_real_,
+      is.na(baseline_value) ~ NA_real_,
+      TRUE ~ ((value - baseline_value) / baseline_value) * 100
+    ),
+    scenario = factor(scenario, levels = scenario_order_plot)
+  )
+
+baseline_df <- ena_df %>%
+  filter(scenario == "Baseline") %>%
+  mutate(indicator = factor(indicator, levels = indicators))
+```
+
+
+```{r}
+# =========================================================
+# EVALUATION ZONES
+# =========================================================
+owf_rast <- rast(zone_raster_file)
+
+# binary OWF footprint
+owf_bin <- ifel(owf_rast > 0, 1, 0)
+
+# same spillover logic as your previous script
+w <- matrix(1, nrow = 5, ncol = 5)
+
+owf_buffered <- focal(
+  owf_bin,
+  w = w,
+  fun = max,
+  na.policy = "omit"
+)
+
+spillover_bin <- ifel(owf_buffered == 1 & owf_bin == 0, 1, 0)
+outside_bin   <- ifel(owf_buffered == 0, 1, 0)
+
+zone_df <- tibble(
+  cell = 1:ncell(owf_bin),
+  in_owf = values(owf_bin, mat = FALSE),
+  in_spill = values(spillover_bin, mat = FALSE),
+  in_outside = values(outside_bin, mat = FALSE)
+) %>%
+  mutate(
+    zone = case_when(
+      in_owf == 1 ~ "OWF",
+      in_spill == 1 ~ "Spillover",
+      in_outside == 1 ~ "Outside OWF",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(cell, zone)
+
+scenario_change_zones <- scenario_change_df %>%
+  left_join(zone_df, by = "cell")
+```
+
+
+```{r}
+# =========================================================
+# ZONAL SUMMARIES
+# =========================================================
+zone_summary_overall <- scenario_change_zones %>%
+  group_by(indicator, scenario) %>%
+  summarise(
+    mean_pct_change = mean(pct_change, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(zone = "Overall")
+
+zone_summary_zones <- scenario_change_zones %>%
+  filter(
+    scenario %in% c("OWF", "OWF + CC"),
+    !is.na(zone)
+  ) %>%
+  group_by(indicator, scenario, zone) %>%
+  summarise(
+    mean_pct_change = mean(pct_change, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+zone_summary <- bind_rows(zone_summary_overall, zone_summary_zones) %>%
+  mutate(
+    zone = factor(zone, levels = c("OWF", "Spillover", "Outside OWF", "Overall"))
+  )
+```
+
+
+```{r}
+# =========================================================
+# ZONE CHECK PLOT
+# =========================================================
+xy_df <- as.data.frame(owf_bin, xy = TRUE, cells = TRUE, na.rm = FALSE) %>%
+  transmute(cell = cell, Lon = x, Lat = y)
+
+zone_plot_df <- xy_df %>%
+  left_join(zone_df, by = "cell") %>%
+  mutate(zone = factor(zone, levels = c("OWF", "Spillover", "Outside OWF")))
+
+zone_check_plot <- ggplot(zone_plot_df, aes(x = Lon, y = Lat, fill = zone)) +
+  geom_raster() +
+  coord_equal() +
+  scale_x_continuous(breaks = pretty(range(zone_plot_df$Lon, na.rm = TRUE), n = 3)) +
+  scale_y_continuous(breaks = pretty(range(zone_plot_df$Lat, na.rm = TRUE), n = 3)) +
+  scale_fill_manual(
+    values = c(
+      "OWF" = "#1f78b4",
+      "Spillover" = "#33a02c",
+      "Outside OWF" = "grey85"
+    ),
+    na.value = "white"
+  ) +
+  labs(
+    title = "OWF zones",
+    x = "Longitude",
+    y = "Latitude",
+    fill = "Zone"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+zone_check_plot
+ggsave(
+  file.path(out_dir, "OWF_zone_check_map.png"),
+  zone_check_plot,
+  width = 8,
+  height = 5,
+  dpi = 800
+)
+```
+
+
+```{r}
+# =========================================================
+# BASELINE MAP SUBPLOT
+# =========================================================
+make_baseline_indicator_subplot <- function(df_panel,
+                                            show_x = FALSE,
+                                            show_y = FALSE) {
+  
+  panel_min <- quantile(df_panel$value, probs = 0.01, na.rm = TRUE)
+  panel_max <- quantile(df_panel$value, probs = 0.99, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- min(df_panel$value, na.rm = TRUE)
+  if (!is.finite(panel_max)) panel_max <- max(df_panel$value, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- 0
+  if (!is.finite(panel_max)) panel_max <- 1
+  
+  if (panel_min == panel_max) {
+    panel_max <- panel_min + 1e-6
+  }
+  
+  p <- ggplot(df_panel, aes(x = Lon, y = Lat, fill = value)) +
+    geom_raster() +
+    geom_polygon(
+      data = land_main_df_plot,
+      aes(x = x, y = y, group = poly_id),
+      inherit.aes = FALSE,
+      fill = "grey85",
+      colour = "grey45",
+      linewidth = 0.2
+      ) +
+coord_equal(expand = FALSE) +
+    scale_x_continuous(
+      breaks = pretty(range(df_panel$Lon, na.rm = TRUE), n = 3)
+    ) +
+    scale_y_continuous(
+      breaks = pretty(range(df_panel$Lat, na.rm = TRUE), n = 3)
+    ) +
+    scale_fill_distiller(
+      palette = "Spectral",
+      direction = -1,
+      limits = c(panel_min, panel_max),
+      oob = scales::squish,
+      breaks = pretty(c(panel_min, panel_max), n = 3),
+      na.value = "white",
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(15, "mm"),
+        barwidth  = unit(5, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(
+      fill = NULL,
+      x = if (show_x) "Longitude" else NULL,
+      y = if (show_y) "Latitude" else NULL
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 11),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      legend.position = c(0.98, 0.02),
+      legend.justification = c(1, 0),
+      legend.box.background = element_rect(
+        colour = "black",
+        fill = scales::alpha("white", 0.75)
+      ),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0.75),
+        colour = NA
+      ),
+      plot.margin = margin(2, 2, 2, 2)
+    )
+  
+  if (!show_x) {
+    p <- p + theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+  }
+  
+  if (!show_y) {
+    p <- p + theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+  }
+  
+  p
+}
+```
+
+
+```{r}
+# =========================================================
+# BASELINE FIGURE (2 x 2 grid)
+# =========================================================
+plot_baseline_figure <- function(df_baseline, out_dir,
+                                 filename = "Baseline_ENA_indicators.png",
+                                 width = 10,
+                                 height = 10) {
+  
+  inds <- levels(df_baseline$indicator)
+  
+  if (length(inds) != 4) {
+    warning("This function is set up for exactly 4 indicators (2x2 layout).")
+  }
+  
+  ncol_layout <- 2
+  nrow_layout <- 2
+  
+  indicator_blocks <- lapply(seq_along(inds), function(i) {
+    ind <- inds[i]
+    df_panel <- df_baseline %>% filter(indicator == ind)
+    
+    row_pos <- ceiling(i / ncol_layout)
+    col_pos <- ((i - 1) %% ncol_layout) + 1
+    
+    ind_title <- ggplot() +
+      annotate(
+        "text",
+        x = 0.02, y = 0.05,
+        label = indicator_label_map[[as.character(ind)]],
+        hjust = 0,
+        fontface = "bold",
+        size = 4.6
+      ) +
+      coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), clip = "off") +
+      theme_void() +
+      theme(plot.margin = margin(0, 0, -8, 0))
+    
+    map_plot <- make_baseline_indicator_subplot(
+      df_panel,
+      show_x = row_pos == nrow_layout,  # only bottom row
+      show_y = col_pos == 1             # only left column
+    )
+    
+    ind_title / map_plot + plot_layout(heights = c(0.02, 0.1))
+  })
+  
+  final_plot <- wrap_plots(indicator_blocks, ncol = ncol_layout)
+  
+  ggsave(
+    filename = file.path(out_dir, filename),
+    plot = final_plot,
+    width = width,
+    height = height,
+    dpi = 800
+  )
+  
+  final_plot
+}
+
+baseline_figure <- plot_baseline_figure(
+  df_baseline = baseline_df,
+  out_dir = out_dir,
+  filename = "Baseline_ENA_indicators.png",
+  width = 9,
+  height = 7
+)
+
+baseline_figure
+```
+
+
+```{r}
+# =========================================================
+# BARPLOT
+# =========================================================
+make_zone_barplot <- function(df_zone_panel) {
+  
+  if (nrow(df_zone_panel) == 0) {
+    return(ggplot() + theme_void())
+  }
+  
+  df_zone_panel <- df_zone_panel %>%
+    mutate(
+      zone_label = case_when(
+        zone == "OWF" ~ "OWF",
+        zone == "Spillover" ~ "SPILL",
+        zone == "Outside OWF" ~ "OUT",
+        zone == "Overall" ~ "ALL",
+        TRUE ~ as.character(zone)
+      ),
+      zone_label = factor(zone_label, levels = c("ALL", "OUT", "OWF", "SPILL")),
+      change_dir = ifelse(mean_pct_change < 0, "decrease", "increase")
+    )
+  
+  ggplot(df_zone_panel, aes(x = zone_label, y = mean_pct_change, fill = change_dir)) +
+    geom_col(width = 0.4) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    scale_x_discrete(
+      limits = c("ALL", "OUT", "OWF", "SPILL"),
+      labels = function(x) {
+        if (length(unique(df_zone_panel$zone_label)) == 1) {
+          ifelse(x == "ALL", "ALL", "")
+        } else {
+          x
+        }
+      }
+    ) +
+    scale_fill_manual(
+      values = c(
+        "decrease" = "#E67E22",
+        "increase" = "#2C7FB8"
+      ),
+      guide = "none"
+    ) +
+    labs(x = NULL, y = NULL) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.title = element_blank(),
+      axis.text.x = element_text(size = 12, angle = 0, hjust = 0.5),
+      axis.text.y = element_text(size = 12),
+      axis.ticks.x = element_blank(),
+      panel.grid = element_blank(),
+      plot.margin = margin(-12, 2, 0, 2)
+    )
+}
+```
+
+
+```{r}
+# =========================================================
+# MAP + BARPLOT PANEL
+# =========================================================
+make_scenario_indicator_panel <- function(df_panel,
+                                          df_zone_panel,
+                                          show_x = FALSE,
+                                          show_y = FALSE) {
+  
+  panel_min <- quantile(df_panel$pct_change, probs = 0.01, na.rm = TRUE)
+  panel_max <- quantile(df_panel$pct_change, probs = 0.99, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- min(df_panel$pct_change, na.rm = TRUE)
+  if (!is.finite(panel_max)) panel_max <- max(df_panel$pct_change, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- -1
+  if (!is.finite(panel_max)) panel_max <- 1
+  
+  if (panel_min == panel_max) {
+    panel_min <- panel_min - 1
+    panel_max <- panel_max + 1
+  }
+  
+  map_plot <- ggplot(df_panel, aes(x = Lon, y = Lat, fill = pct_change)) +
+    geom_raster() +
+    geom_polygon(
+      data = land_main_df_plot,
+      aes(x = x, y = y, group = poly_id),
+      inherit.aes = FALSE,
+      fill = "grey85",
+      colour = "grey45",
+      linewidth = 0.2
+      ) +
+    coord_equal(expand = FALSE) +
+    scale_x_continuous(breaks = pretty(range(df_panel$Lon, na.rm = TRUE), n = 3)) +
+    scale_y_continuous(breaks = pretty(range(df_panel$Lat, na.rm = TRUE), n = 3)) +
+    scale_fill_gradient2(
+      low = "#E67E22",
+      mid = "white",
+      high = "#2C7FB8",
+      midpoint = 0,
+      limits = c(panel_min, panel_max),
+      oob = scales::squish,
+      breaks = pretty(c(panel_min, panel_max), n = 3),
+      labels = function(x) paste0(round(x, 1), "%"),
+      na.value = "white",
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(13, "mm"),
+        barwidth  = unit(4.5, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(
+      fill = NULL,
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 11),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      legend.position = c(0.98, 0.02),
+      legend.justification = c(1, 0),
+      legend.box.background = element_rect(
+        colour = "black",
+        fill = scales::alpha("white", 0.75)
+      ),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0.75),
+        colour = NA
+      ),
+      plot.margin = margin(2, 2, -6, 2)
+    )
+  
+  if (!show_x) {
+    map_plot <- map_plot + theme(
+      axis.title.x = element_text(colour = NA),
+      axis.text.x  = element_text(colour = NA),
+      axis.ticks.x = element_line(colour = NA)
+    )
+  }
+  
+  if (!show_y) {
+    map_plot <- map_plot + theme(
+      axis.title.y = element_text(colour = NA),
+      axis.text.y  = element_text(colour = NA),
+      axis.ticks.y = element_line(colour = NA)
+    )
+  }
+  
+  bar_plot <- make_zone_barplot(df_zone_panel)
+  
+  map_plot / bar_plot + plot_layout(heights = c(1, 0.6))
+}
+```
+
+
+```{r}
+# =========================================================
+# SCENARIO FIGURE
+# =========================================================
+plot_grouped_scenario_figure <- function(df_change, zone_summary, indicators,
+                                         out_dir, filename,
+                                         width = 14, height = 10) {
+  
+  df_grp <- df_change %>%
+    filter(indicator %in% indicators) %>%
+    mutate(indicator = factor(indicator, levels = indicators))
+  
+  header_row <- wrap_plots(
+    list(
+      ggplot() + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.375, y = 0.2, label = "CC",
+                 fontface = "bold", size = 6) +
+        xlim(0, 1) + ylim(0, 1) + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.375, y = 0.2, label = "OWF",
+                 fontface = "bold", size = 6) +
+        xlim(0, 1) + ylim(0, 1) + theme_void(),
+      ggplot() +
+        annotate("text", x = 0.375, y = 0.2, label = "OWF + CC",
+                 fontface = "bold", size = 6) +
+        xlim(0, 1) + ylim(0, 1) + theme_void()
+    ),
+    ncol = 4
+  ) +
+    plot_layout(widths = c(0.9, 3, 3, 3))
+  
+  row_blocks <- lapply(seq_along(indicators), function(i) {
+    ind <- indicators[i]
+    df_ind <- df_grp %>% filter(indicator == ind)
+    
+    row_title <- ggplot() +
+      annotate(
+        "text",
+        x = 0.02, y = 0.25,
+        label = indicator_label_map[[as.character(ind)]],
+        hjust = 0,
+        fontface = "bold",
+        size = 4.6
+      ) +
+      coord_cartesian(xlim = c(0, 1), ylim = c(0, 1), clip = "off") +
+      theme_void() +
+      theme(plot.margin = margin(0, 0, -8, 0))
+    
+    scen_levels <- c("CC", "OWF", "OWF + CC")
+    
+    row_maps <- lapply(seq_along(scen_levels), function(j) {
+      sc <- scen_levels[j]
+      
+      df_panel <- df_ind %>% filter(scenario == sc)
+      
+      df_zone_panel <- zone_summary %>%
+        filter(indicator == ind, scenario == sc)
+      
+      make_scenario_indicator_panel(
+        df_panel = df_panel,
+        df_zone_panel = df_zone_panel,
+        show_x = i == length(indicators),
+        show_y = j == 1
+      )
+    })
+    
+    maps_row <- wrap_plots(row_maps, ncol = 3)
+    
+    row_title / maps_row + plot_layout(heights = c(0.02, 0.1))
+  })
+  
+  maps_block <- wrap_plots(row_blocks, ncol = 1)
+  
+  final_plot <- header_row / maps_block +
+    plot_layout(heights = c(0.04, 1))
+  
+  ggsave(
+    filename = file.path(out_dir, filename),
+    plot = final_plot,
+    width = width,
+    height = height,
+    dpi = 800
+  )
+  
+  final_plot
+}
+```
+
+
+```{r}
+scenario_figure <- plot_grouped_scenario_figure(
+  df_change = scenario_change_df,
+  zone_summary = zone_summary,
+  indicators = indicators,
+  out_dir = out_dir,
+  filename = "Scenario_ENA_indicators.png",
+  width = 14,
+  height = 18.5
+)
+scenario_figure
+```
+
+Only maps
+```{r}
+make_top_row_panel <- function(plot_obj, label) {
+  title_plot <- ggplot() +
+    annotate(
+      "text",
+      x = 0.02, y = 0.3,
+      label = label,
+      hjust = 0,
+      fontface = "bold",
+      size = 4.8
+    ) +
+    xlim(0, 1) + ylim(0, 1) +
+    theme_void() +
+    theme(plot.margin = margin(0, 0, -6, 0))
+  
+  title_plot / plot_obj + plot_layout(heights = c(0.12, 1))
+}
+
+# =========================================================
+# MAP ONLY PANEL
+# =========================================================
+make_scenario_indicator_map <- function(df_panel,
+                                        show_x = FALSE,
+                                        show_y = FALSE,
+                                        indicator_label = NULL) {
+  
+  panel_min <- quantile(df_panel$pct_change, probs = 0.01, na.rm = TRUE)
+  panel_max <- quantile(df_panel$pct_change, probs = 0.99, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- min(df_panel$pct_change, na.rm = TRUE)
+  if (!is.finite(panel_max)) panel_max <- max(df_panel$pct_change, na.rm = TRUE)
+  
+  if (!is.finite(panel_min)) panel_min <- -1
+  if (!is.finite(panel_max)) panel_max <- 1
+  
+  if (panel_min == panel_max) {
+    panel_min <- panel_min - 1
+    panel_max <- panel_max + 1
+  }
+  
+  map_plot <- ggplot(df_panel, aes(x = Lon, y = Lat, fill = pct_change)) +
+    geom_raster() +
+    geom_polygon(
+      data = land_main_df_plot,
+      aes(x = x, y = y, group = poly_id),
+      inherit.aes = FALSE,
+      fill = "grey85",
+      colour = "grey45",
+      linewidth = 0.2
+    ) +
+    coord_equal(expand = FALSE, clip = "off") +
+    scale_x_continuous(breaks = pretty(range(df_panel$Lon, na.rm = TRUE), n = 3)) +
+    scale_y_continuous(breaks = pretty(range(df_panel$Lat, na.rm = TRUE), n = 3)) +
+    scale_fill_gradient2(
+      low = "#E67E22",
+      mid = "white",
+      high = "#2C7FB8",
+      midpoint = 0,
+      limits = c(panel_min, panel_max),
+      oob = scales::squish,
+      breaks = pretty(c(panel_min, panel_max), n = 3),
+      labels = function(x) paste0(round(x, 1), "%"),
+      na.value = "white",
+      guide = guide_colorbar(
+        title.position = "top",
+        barheight = unit(13, "mm"),
+        barwidth  = unit(4.5, "mm"),
+        frame.colour = "black",
+        ticks.colour = "black"
+      )
+    ) +
+    labs(
+      fill = NULL,
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      legend.title = element_blank(),
+      legend.text = element_text(size = 11),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white", colour = NA),
+      legend.position = c(0.98, 0.02),
+      legend.justification = c(1, 0),
+      legend.box.background = element_rect(
+        colour = "black",
+        fill = scales::alpha("white", 0.75)
+      ),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0.75),
+        colour = NA
+      ),
+      plot.margin = margin(22, 2, 2, 2)
+    )
+  
+  if (!show_x) {
+    map_plot <- map_plot + theme(
+      axis.title.x = element_text(colour = NA),
+      axis.text.x  = element_text(colour = NA),
+      axis.ticks.x = element_line(colour = NA)
+    )
+  }
+  
+  if (!show_y) {
+    map_plot <- map_plot + theme(
+      axis.title.y = element_text(colour = NA),
+      axis.text.y  = element_text(colour = NA),
+      axis.ticks.y = element_line(colour = NA)
+    )
+  }
+  
+if (!is.null(indicator_label)) {
+  map_plot <- map_plot +
+    labs(title = indicator_label) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 14,
+        hjust = 0
+      )
+    )
+}
+  
+  map_plot
+}
+```
+
+```{r}
+# =========================================================
+# SCENARIO FIGURE - MAPS ONLY
+# =========================================================
+plot_grouped_scenario_maps_only <- function(df_change, indicators,
+                                            out_dir, filename,
+                                            width = 12, height = 9) {
+  
+  df_grp <- df_change %>%
+    filter(indicator %in% indicators) %>%
+    mutate(indicator = factor(indicator, levels = indicators))
+  
+  scen_levels <- c("CC", "OWF", "OWF + CC")
+  
+  make_header_cell <- function(label) {
+    ggplot() +
+      annotate("text", x = 0.5, y = 0.5, label = label,
+               fontface = "bold", size = 6) +
+      xlim(0, 1) + ylim(0, 1) +
+      theme_void()
+  }
+  
+  # -------------------------
+  # top header row
+  # -------------------------
+  plot_list <- list(
+    make_header_cell("CC"),
+    make_header_cell("OWF"),
+    make_header_cell("OWF + CC")
+  )
+  
+  # -------------------------
+  # rows per indicator
+  # -------------------------
+for (i in seq_along(indicators)) {
+  ind <- indicators[i]
+  df_ind <- df_grp %>% filter(indicator == ind)
+  
+  for (j in seq_along(scen_levels)) {
+    sc <- scen_levels[j]
+    df_panel <- df_ind %>% filter(scenario == sc)
+    
+    p <- make_scenario_indicator_map(
+      df_panel = df_panel,
+      show_x = i == length(indicators),
+      show_y = j == 1,
+      indicator_label = if (j == 1) indicator_label_map[[as.character(ind)]] else NULL
+    )
+    
+    plot_list <- c(plot_list, list(p))
+  }
+}
+  
+  final_plot <- wrap_plots(
+    plotlist = plot_list,
+    ncol = 3,
+    byrow = TRUE
+  ) +
+    plot_layout(
+      widths = c(1, 1, 1),
+      heights = c(0.18, rep(1, length(indicators)))
+    )
+  
+  ggsave(
+    filename = file.path(out_dir, filename),
+    plot = final_plot,
+    width = width,
+    height = height,
+    dpi = 800
+  )
+  
+  final_plot
+}
+```
+
+```{r}
+scenario_maps_only <- plot_grouped_scenario_maps_only(
+  df_change = scenario_change_df,
+  indicators = indicators,
+  out_dir = out_dir,
+  filename = "Scenario_ENA_indicators_maps_only.png",
+  width = 14,
+  height = 14
+)
+
+scenario_maps_only
+```
+
+
+```{r}
+# =========================================================
+# SUMMARY TABLES FOR SELECTED ENA INDICATORS
+# Same structure as for biomass / catch / TL indicators
+# =========================================================
+
+library(dplyr)
+library(tidyr)
+library(readr)
+
+# ---------------------------------------------------------
+# 1. Prepare ENA data with clean indicator labels
+# ---------------------------------------------------------
+ena_table_df <- ena_df %>%
+  mutate(
+    indicator = recode(
+      as.character(indicator),
+      "FCI" = "FCI",
+      "H" = "H",
+      "RDC_internal_CAP" = "RDC",
+      "SOI" = "SOI"
+    )
+  )
+
+# ---------------------------------------------------------
+# 2. Attach evaluation zones to ALL scenarios, including Baseline
+# ---------------------------------------------------------
+ena_table_zones <- ena_table_df %>%
+  left_join(zone_df, by = "cell") %>%
+  mutate(
+    zone = case_when(
+      zone == "OWF" ~ "OWF",
+      zone == "Spillover" ~ "SPILL",
+      zone == "Outside OWF" ~ "OUT",
+      TRUE ~ NA_character_
+    )
+  )
+
+# ---------------------------------------------------------
+# 3. Mean absolute ENA value per indicator × scenario × zone
+#    Include:
+#    - ALL = whole study area
+#    - OWF / SPILL / OUT = zonal subsets
+# ---------------------------------------------------------
+ena_summary_all <- ena_table_zones %>%
+  group_by(indicator, scenario) %>%
+  summarise(
+    abs_value = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(zone = "ALL")
+
+ena_summary_zones <- ena_table_zones %>%
+  filter(!is.na(zone)) %>%
+  group_by(indicator, scenario, zone) %>%
+  summarise(
+    abs_value = mean(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ena_summary_abs <- bind_rows(ena_summary_all, ena_summary_zones)
+
+# ---------------------------------------------------------
+# 4. Baseline zonal reference
+# ---------------------------------------------------------
+ena_baseline_ref <- ena_summary_abs %>%
+  filter(scenario == "Baseline") %>%
+  select(
+    indicator,
+    zone,
+    baseline_abs_value = abs_value
+  )
+
+# ---------------------------------------------------------
+# 5. Scenario summaries relative to baseline of the SAME zone
+# ---------------------------------------------------------
+ena_summary_vs_baseline <- ena_summary_abs %>%
+  filter(scenario != "Baseline") %>%
+  left_join(ena_baseline_ref, by = c("indicator", "zone")) %>%
+  mutate(
+    abs_change = abs_value - baseline_abs_value,
+    pct_change = case_when(
+      baseline_abs_value == 0 & abs_value == 0 ~ 0,
+      baseline_abs_value == 0 & abs_value != 0 ~ NA_real_,
+      is.na(baseline_abs_value) ~ NA_real_,
+      TRUE ~ ((abs_value - baseline_abs_value) / baseline_abs_value) * 100
+    )
+  ) %>%
+  mutate(
+    indicator = factor(indicator, levels = c("FCI", "H", "RDC", "SOI")),
+    scenario = factor(scenario, levels = c("CC", "OWF", "OWF + CC")),
+    zone = factor(zone, levels = c("ALL", "OWF", "SPILL", "OUT"))
+  ) %>%
+  arrange(indicator, scenario, zone)
+```
+
+
+```{r}
+# ---------------------------------------------------------
+# 6. Formatting helpers
+# ---------------------------------------------------------
+format_abs_cell <- function(x, digits = 3) {
+  ifelse(
+    is.na(x),
+    "NA",
+    formatC(x, format = "f", digits = digits)
+  )
+}
+
+format_pct_cell <- function(x, digits = 1) {
+  ifelse(
+    is.na(x),
+    "NA",
+    paste0(
+      ifelse(x > 0, "+", ""),
+      formatC(x, format = "f", digits = digits),
+      "%"
+    )
+  )
+}
+
+format_abs_change_cell <- function(x, digits = 3) {
+  ifelse(
+    is.na(x),
+    "NA",
+    paste0(
+      ifelse(x > 0, "+", ""),
+      formatC(x, format = "f", digits = digits)
+    )
+  )
+}
+
+format_abs_and_pct_cell <- function(abs_change, pct_change,
+                                    abs_digits = 3,
+                                    pct_digits = 1) {
+  
+  abs_txt <- ifelse(
+    is.na(abs_change),
+    "NA",
+    paste0(
+      ifelse(abs_change > 0, "+", ""),
+      formatC(abs_change, format = "f", digits = abs_digits)
+    )
+  )
+  
+  pct_txt <- ifelse(
+    is.na(pct_change),
+    "NA",
+    paste0(
+      ifelse(pct_change > 0, "+", ""),
+      formatC(pct_change, format = "f", digits = pct_digits),
+      "%"
+    )
+  )
+  
+  paste0(abs_txt, " (", pct_txt, ")")
+}
+
+format_abs_and_rel_cell <- function(abs_value, pct_change,
+                                    abs_digits = 3,
+                                    pct_digits = 1) {
+  
+  abs_txt <- ifelse(
+    is.na(abs_value),
+    "NA",
+    formatC(abs_value, format = "f", digits = abs_digits)
+  )
+  
+  pct_txt <- ifelse(
+    is.na(pct_change),
+    "NA",
+    paste0(
+      ifelse(pct_change > 0, "+", ""),
+      formatC(pct_change, format = "f", digits = pct_digits),
+      "%"
+    )
+  )
+  
+  paste0(abs_txt, " (", pct_txt, ")")
+}
+```
+
+
+```{r}
+# ---------------------------------------------------------
+# 7. TABLE A: absolute value + relative change
+#    Example: 0.345 (+5.6%)
+# ---------------------------------------------------------
+ena_table_abs_and_rel <- ena_summary_vs_baseline %>%
+  mutate(
+    cell = format_abs_and_rel_cell(abs_value, pct_change)
+  ) %>%
+  unite(col_name, scenario, zone, sep = "_") %>%
+  select(indicator, col_name, cell) %>%
+  pivot_wider(names_from = col_name, values_from = cell) %>%
+  select(
+    indicator,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  ) %>%
+  mutate(indicator = as.character(indicator))
+
+ena_table_abs_and_rel
+
+# ---------------------------------------------------------
+# 8. TABLE B: only relative changes (%)
+# ---------------------------------------------------------
+ena_table_pct <- ena_summary_vs_baseline %>%
+  mutate(
+    cell = format_pct_cell(pct_change)
+  ) %>%
+  unite(col_name, scenario, zone, sep = "_") %>%
+  select(indicator, col_name, cell) %>%
+  pivot_wider(names_from = col_name, values_from = cell) %>%
+  select(
+    indicator,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  ) %>%
+  mutate(indicator = as.character(indicator))
+
+ena_table_pct
+
+# ---------------------------------------------------------
+# 9. TABLE C: only absolute changes (+/- X)
+# ---------------------------------------------------------
+ena_table_abs_change <- ena_summary_vs_baseline %>%
+  mutate(
+    cell = format_abs_change_cell(abs_change)
+  ) %>%
+  unite(col_name, scenario, zone, sep = "_") %>%
+  select(indicator, col_name, cell) %>%
+  pivot_wider(names_from = col_name, values_from = cell) %>%
+  select(
+    indicator,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  ) %>%
+  mutate(indicator = as.character(indicator))
+
+ena_table_abs_change
+
+# ---------------------------------------------------------
+# 10. TABLE D: absolute change + relative change
+#     Example: +0.012 (+5.6%)
+# ---------------------------------------------------------
+ena_table_abs_change_and_pct <- ena_summary_vs_baseline %>%
+  mutate(
+    cell = format_abs_and_pct_cell(abs_change, pct_change)
+  ) %>%
+  unite(col_name, scenario, zone, sep = "_") %>%
+  select(indicator, col_name, cell) %>%
+  pivot_wider(names_from = col_name, values_from = cell) %>%
+  select(
+    indicator,
+    CC_ALL, CC_OWF, CC_SPILL, CC_OUT,
+    OWF_ALL, OWF_OWF, OWF_SPILL, OWF_OUT,
+    `OWF + CC_ALL`, `OWF + CC_OWF`, `OWF + CC_SPILL`, `OWF + CC_OUT`
+  ) %>%
+  mutate(indicator = as.character(indicator))
+
+ena_table_abs_change_and_pct
+
+# ---------------------------------------------------------
+# 11. OPTIONAL: numeric export table
+# ---------------------------------------------------------
+ena_table_numeric <- ena_summary_vs_baseline %>%
+  pivot_wider(
+    names_from = c(scenario, zone),
+    values_from = c(abs_value, abs_change, pct_change),
+    names_glue = "{scenario}_{zone}_{.value}"
+  ) %>%
+  arrange(indicator)
+
+ena_table_numeric
+```
+
+
+```{r}
+# ---------------------------------------------------------
+# 12. EXPORT
+# ---------------------------------------------------------
+write_csv(
+  ena_table_abs_and_rel,
+  file.path("ENA_summary_table_abs_and_rel.csv")
+)
+
+write_csv(
+  ena_table_pct,
+  file.path("ENA_summary_table_pct_only.csv")
+)
+
+write_csv(
+  ena_table_abs_change,
+  file.path("ENA_summary_table_abs_change_only.csv")
+)
+
+write_csv(
+  ena_table_abs_change_and_pct,
+  file.path("ENA_summary_table_abs_change_and_pct.csv")
+)
+
+write_csv(
+  ena_table_numeric,
+  file.path("ENA_summary_table_numeric.csv")
+)
+```
+

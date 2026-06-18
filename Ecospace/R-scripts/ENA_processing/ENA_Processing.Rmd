@@ -1,0 +1,138 @@
+---
+title: "ENA_Processing"
+author: "Dries Lorré"
+date: "2026-03-13"
+output: html_document
+---
+
+In this code, we process the Ecological Network Analysis data, map some ecological indicators of interest and make a spatial region summary of the ENA indicators.
+
+Key packages
+```{r}
+# install.packages("enaR")
+# install.packages("remotes")
+remotes::install_github("SEELab/enaR")
+library(remotes)
+library(enaR)
+library(terra)
+library(dplyr)
+library(purrr)
+library(stringr)
+```
+
+Map structure
+```{r}
+scenario_dirs <- c(
+  Baseline  = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_baseline_test",
+  CC        = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_CC_test",
+  OWF       = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_test",
+  OWF_CC    = "C:/Users/dlorr/OneDrive - UGent/Documents/EwE output/SBNS_CC_adapted_spatial_OWF_CC_test"
+)
+
+csv_subfolder <- "Test_Env_resps"
+```
+
+
+```{r}
+get_timestep_path <- function(scenario, timestep = "01920") {
+
+  file.path(
+    scenario_dirs[[scenario]],
+    csv_subfolder,
+    "ena_data",
+    paste0("TimeStep=", timestep)
+  )
+
+}
+
+ts_path <- get_timestep_path("Baseline", "01920")
+
+list.files(ts_path)[1:10]
+```
+Test reading in SCOR files
+```{r}
+# Read in file
+file_test <- list.files(ts_path, pattern="\\.txt$", full.names=TRUE)[1]
+file_test
+
+# Load with enaR
+
+net <- enaR::read.scor(file_test)
+net
+
+ena <- enaFlow(net)
+str(ena, max.level = 1)
+names(ena)
+
+colnames(ena$ns)
+ena$ns
+ena$ns
+enaAll(net)
+# Quantena# Quantify imbalance
+ssCheck(net)
+unpack(net)
+
+library(enaR)
+
+net <- read.scor(file_test)
+args(enaR::enaAll)
+ena_full <- enaAll(net, balance.override = TRUE)
+
+ls("package:enaR")
+grep("^ena", ls("package:enaR"), value = TRUE)
+
+
+# already works
+flow <- enaFlow(net)
+
+# next checks
+asc  <- tryCatch(enaAscendency(net), error = function(e) e)
+tro  <- tryCatch(enaTroAgg(net), error = function(e) e)
+strc <- tryCatch(enaStructure(net), error = function(e) e)
+ctrl <- tryCatch(enaControl(net), error = function(e) e)
+# cycl <- tryCatch(enaCycle(net), error = function(e) e)
+envi <- tryCatch(enaEnviron(net), error = function(e) e)
+mti <- tryCatch(enaMTI(net), error = function(e) e)
+
+
+# inspect summaries if objects are returned
+if (!inherits(asc, "error")) names(asc)
+if (!inherits(tro, "error")) names(tro)
+if (!inherits(strc, "error")) names(strc)
+
+flow <- enaFlow(net)
+colnames(flow$ns)
+
+get.ns(flow)
+get.ns(tro)
+get.ns(strc)
+
+colnames(asc)
+# flow$ns
+
+colnames(flow$ns)
+# flow$ns
+
+colnames(tro$ns)
+# tro$ns
+
+colnames(strc$ns)
+# strc$ns
+
+colnames(ctrl$ns)
+# ctrl$ns
+
+colnames(cycl$ns)
+# cycl$ns
+
+colnames(envi$ns)
+# envi$ns
+
+colnames(mti$ns)
+# mti$ns
+
+install.packages("NetIndices")
+library(NetIndices)
+
+
+
